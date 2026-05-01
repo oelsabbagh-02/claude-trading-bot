@@ -115,7 +115,7 @@ Step-by-step guides for all supported exchanges:
 | Bybit | [docs/exchanges/bybit.md](docs/exchanges/bybit.md) |
 | OKX | [docs/exchanges/okx.md](docs/exchanges/okx.md) |
 | Coinbase Advanced | [docs/exchanges/coinbase.md](docs/exchanges/coinbase.md) |
-| Kraken | [docs/exchanges/kraken.md](docs/exchanges/kraken.md) |
+| OKX | [docs/exchanges/okx.md](docs/exchanges/okx.md) |
 | KuCoin | [docs/exchanges/kucoin.md](docs/exchanges/kucoin.md) |
 | Gate.io | [docs/exchanges/gateio.md](docs/exchanges/gateio.md) |
 | MEXC | [docs/exchanges/mexc.md](docs/exchanges/mexc.md) |

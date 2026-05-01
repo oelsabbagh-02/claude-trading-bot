@@ -1,0 +1,13 @@
+[
+  {
+    "symbol": "ETHUSDT",
+    "direction": "bullish",
+    "entryPrice": 2285.31,
+    "stopLoss": 2273.88345,
+    "takeProfit": 2299.2267290670907,
+    "strategy": "mean_reversion",
+    "tradeSize": 10,
+    "entryTime": "2026-05-01T21:00:08.238Z",
+    "id": "PAPER-1777669208238"
+  }
+]

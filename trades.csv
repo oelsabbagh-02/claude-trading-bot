@@ -1,2 +1,9 @@
-Date,Time (UTC),Exchange,Symbol,Side,Quantity,Price,Total USD,Fee (est.),Net Amount,Order ID,Mode,Notes
-,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"
+Date,Time (UTC),Exchange,Symbol,Side,Qty,Entry,Exit,Size USD,Fee est.,P&L USD,P&L %,Hold (h),Order ID,Mode,Note
+2026-05-01,21:00:08,Kraken,XBTUSDT,,,,,,,,,,,BLOCKED,BLOCKED,mean_reversion,ranging,,"Failed: Price 0.5–2% below VWAP"
+2026-05-01,21:00:08,Kraken,XBTUSDT,,,,,,,,,,,BLOCKED,BLOCKED,mean_reversion,ranging,,"Failed: Price 0.5–2% below VWAP"
+2026-05-01,21:00:08,Kraken,ETHUSDT,BUY,0.00437577,2285.31,,10.00,0.0160,9.98,,,,PAPER-1777669208237,PAPER,mean_reversion,ranging,,Opened
+2026-05-01,21:00:08,Kraken,ETHUSDT,,,,,,,,,,,BLOCKED,BLOCKED,mean_reversion,ranging,,"Failed: Duplicate position"
+2026-05-01,21:00:08,Kraken,SOLUSDT,,,,,,,,,,,BLOCKED,BLOCKED,mean_reversion,ranging,,"Failed: Price 0.5–2% below VWAP"
+2026-05-01,21:00:08,Kraken,SOLUSDT,,,,,,,,,,,BLOCKED,BLOCKED,mean_reversion,ranging,,"Failed: Price 0.5–2% below VWAP"
+2026-05-01,21:00:08,Kraken,XRPUSDT,,,,,,,,,,,BLOCKED,BLOCKED,mean_reversion,ranging,,"Failed: Price 0.5–2% above VWAP; RSI(3) above 75 (extreme overbought)"
+2026-05-01,21:00:08,Kraken,XRPUSDT,,,,,,,,,,,BLOCKED,BLOCKED,mean_reversion,ranging,,"Failed: Price 0.5–2% above VWAP; RSI(3) above 75 (extreme overbought)"
