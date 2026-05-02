@@ -9,6 +9,7 @@
 import "dotenv/config";
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import crypto from "crypto";
+import http from "http";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -664,8 +665,60 @@ async function loop() {
   }
 }
 
+// ─── HTTP status server ───────────────────────────────────────────────────────
+
+let lastRunState = null;
+
+async function buildStatus() {
+  const positions = loadJson(POSITIONS_FILE, []);
+  const livePositions = loadJson(LIVE_POSITIONS_FILE, []);
+  const fearGreed = await fetchFearGreed().catch(() => null);
+  const todayCount = countTodaysTrades();
+
+  const positionsWithPnl = await Promise.all(positions.map(async p => {
+    try {
+      const candles = await fetchCandles(p.symbol, CONFIG.timeframe, 2);
+      const price = candles.at(-1)?.close ?? p.entryPrice;
+      const pnlUSD = p.side === "buy" ? (price - p.entryPrice) / p.entryPrice * p.size
+                                      : (p.entryPrice - price) / p.entryPrice * p.size;
+      return { ...p, currentPrice: price, pnlUSD: parseFloat(pnlUSD.toFixed(2)), pnlPct: parseFloat((pnlUSD / p.size * 100).toFixed(2)) };
+    } catch { return p; }
+  }));
+
+  return {
+    time: new Date().toISOString(),
+    mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
+    symbols: CONFIG.symbols,
+    fearGreed: fearGreed ? { value: fearGreed.value, label: fearGreed.label } : null,
+    tradesToday: todayCount,
+    maxTradesPerDay: CONFIG.maxTradesPerDay,
+    paperPositions: positionsWithPnl,
+    livePositions,
+  };
+}
+
+function startStatusServer() {
+  const port = parseInt(process.env.PORT || "3000", 10);
+  http.createServer(async (req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    try {
+      const status = await buildStatus();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(status, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  }).listen(port, () => console.log(`Status server: http://localhost:${port}`));
+}
+
 if (process.argv.includes("--summary")) {
   showSummary().catch(err => console.error(err.message));
 } else {
+  startStatusServer();
   loop();
 }
