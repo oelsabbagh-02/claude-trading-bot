@@ -176,7 +176,7 @@ function generateSignal(closes, htfCloses, fearGreed, weeklySentiment) {
   if (trend1h === "up" && trend4h === "up" && rsi14 >= 40 && rsi14 <= 65 && fg < 85 && wBias !== "bearish") {
     return {
       side: "buy",
-      reason: `EMA20>${ema20.toFixed(0)} > EMA50>${ema50.toFixed(0)} on 1H+4H | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      reason: `EMA20 ${ema20.toFixed(4)} > EMA50 ${ema50.toFixed(4)} on 1H+4H | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
     };
   }
 
@@ -184,7 +184,7 @@ function generateSignal(closes, htfCloses, fearGreed, weeklySentiment) {
   if (CONFIG.paperTrading && trend1h === "down" && trend4h === "down" && rsi14 >= 35 && rsi14 <= 60 && fg > 15 && wBias !== "bullish") {
     return {
       side: "sell",
-      reason: `EMA20 ${ema20.toFixed(0)} < EMA50 ${ema50.toFixed(0)} on 1H+4H | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      reason: `EMA20 ${ema20.toFixed(4)} < EMA50 ${ema50.toFixed(4)} on 1H+4H | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
     };
   }
 
@@ -483,7 +483,7 @@ async function showSummary() {
   }
   if (openPos.length) {
     console.log("\n  Open paper positions:");
-    openPos.forEach(p => console.log(`    ${p.side.toUpperCase()} ${p.symbol} @ $${p.entryPrice.toFixed(4)} (opened ${p.openedAt.slice(0, 10)})`));
+    openPos.filter(p => p.side && p.symbol).forEach(p => console.log(`    ${p.side.toUpperCase()} ${p.symbol} @ $${p.entryPrice?.toFixed(4)} (opened ${p.openedAt?.slice(0, 10)})`));
   }
 
   const livePos = loadJson(LIVE_POSITIONS_FILE, []);
@@ -534,7 +534,8 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment) {
   const ema20     = calcEMA(closes, 20);
   const ema50     = calcEMA(closes, 50);
 
-  console.log(`  Price $${price.toFixed(4)} | RSI(14) ${rsi14?.toFixed(1)} | EMA20 ${ema20?.toFixed(0)} / EMA50 ${ema50?.toFixed(0)} | ATR $${atr?.toFixed(4)}`);
+  const pd = price >= 100 ? 2 : price >= 1 ? 4 : 6;
+  console.log(`  Price $${price.toFixed(pd)} | RSI(14) ${rsi14?.toFixed(1)} | EMA20 ${ema20?.toFixed(pd)} / EMA50 ${ema50?.toFixed(pd)} | ATR $${atr?.toFixed(pd)}`);
 
   // Check & close any existing paper positions for this symbol
   if (CONFIG.paperTrading) checkExits(symbol, price, closes);
