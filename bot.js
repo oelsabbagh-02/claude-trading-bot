@@ -539,25 +539,32 @@ function logClosedTrade(pos, exitPrice, pnlUSD, pnlPct, holdH, exitReason) {
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
 
-async function showSummary() {
-  if (!existsSync(CSV_FILE)) { console.log("No trades yet."); return; }
-
+function computeStats() {
+  if (!existsSync(CSV_FILE)) {
+    return { closed: [], wins: [], losses: [], blocked: [], totalPnl: 0, winRate: null, avgWin: 0, avgLoss: 0 };
+  }
   const rows = readFileSync(CSV_FILE, "utf8").trim().split("\n").slice(1)
     .filter(Boolean).map(l => l.split(","));
-
   const blocked = rows.filter(r => r[13]?.trim() === "BLOCKED");
   const closed  = rows.filter(r => {
     const note = r[15]?.replace(/"/g, "").trim() ?? "";
     return note !== "Opened" && note !== "" && r[13]?.trim() !== "BLOCKED";
   });
-
-  const wins    = closed.filter(r => parseFloat(r[10] || 0) > 0);
-  const losses  = closed.filter(r => parseFloat(r[10] || 0) <= 0);
+  const wins   = closed.filter(r => parseFloat(r[10] || 0) > 0);
+  const losses = closed.filter(r => parseFloat(r[10] || 0) <= 0);
   const totalPnl = closed.reduce((s, r) => s + parseFloat(r[10] || 0), 0);
-  const winRate  = closed.length ? ((wins.length / closed.length) * 100).toFixed(1) : "—";
+  const winRate  = closed.length ? (wins.length / closed.length) * 100 : null;
   const avgWin   = wins.length   ? wins.reduce((s, r) => s + parseFloat(r[10] || 0), 0) / wins.length : 0;
   const avgLoss  = losses.length ? losses.reduce((s, r) => s + parseFloat(r[10] || 0), 0) / losses.length : 0;
+  return { rows, closed, wins, losses, blocked, totalPnl, winRate, avgWin, avgLoss };
+}
+
+async function showSummary() {
+  if (!existsSync(CSV_FILE)) { console.log("No trades yet."); return; }
+
+  const { closed, wins, losses, blocked, totalPnl, winRate, avgWin, avgLoss } = computeStats();
   const openPos  = loadJson(POSITIONS_FILE, []);
+  const winRateStr = winRate !== null ? winRate.toFixed(1) : "—";
 
   console.log("\n═══════════════════════════════════════════");
   console.log("  Trading Summary — OKX");
@@ -565,7 +572,7 @@ async function showSummary() {
   console.log(`  Open positions : ${openPos.length}`);
   console.log(`  Closed trades  : ${closed.length}  (${wins.length}W / ${losses.length}L)`);
   console.log(`  Blocked        : ${blocked.length}`);
-  console.log(`  Win rate       : ${winRate}%`);
+  console.log(`  Win rate       : ${winRateStr}%`);
   console.log(`  Total P&L      : ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`);
   if (wins.length)   console.log(`  Avg win        : +$${avgWin.toFixed(2)}`);
   if (losses.length) console.log(`  Avg loss       : $${avgLoss.toFixed(2)}`);
@@ -834,12 +841,45 @@ async function buildStatus() {
   };
 }
 
+function buildSummaryJson() {
+  const { closed, wins, losses, blocked, totalPnl, winRate, avgWin, avgLoss } = computeStats();
+  const openPaper = loadJson(POSITIONS_FILE, []);
+  const openLive  = loadJson(LIVE_POSITIONS_FILE, []);
+  return {
+    time: new Date().toISOString(),
+    mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
+    closedTrades: closed.length,
+    wins:   wins.length,
+    losses: losses.length,
+    blocked: blocked.length,
+    winRatePct: winRate !== null ? parseFloat(winRate.toFixed(1)) : null,
+    totalPnlUSD: parseFloat(totalPnl.toFixed(2)),
+    avgWinUSD:  parseFloat(avgWin.toFixed(2)),
+    avgLossUSD: parseFloat(avgLoss.toFixed(2)),
+    avgRR: wins.length && losses.length ? parseFloat(Math.abs(avgWin / avgLoss).toFixed(2)) : null,
+    openPaperPositions: openPaper.length,
+    openLivePositions:  openLive.length,
+    paperPositions: openPaper,
+    livePositions:  openLive,
+  };
+}
+
 function startStatusServer() {
   const port = parseInt(process.env.PORT || "3000", 10);
   http.createServer(async (req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("ok");
+      return;
+    }
+    if (req.url === "/summary") {
+      try {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(buildSummaryJson(), null, 2));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
       return;
     }
     try {
