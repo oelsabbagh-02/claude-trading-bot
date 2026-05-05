@@ -2,3 +2,11 @@
 *.log
 safety-check-log.json
 node_modules/
+
+# Runtime state — must not be committed (would corrupt Railway's history)
+bot.lock
+trades.csv
+paper-positions.json
+live-positions.json
+trending-watchlist.json
+sentiment.json

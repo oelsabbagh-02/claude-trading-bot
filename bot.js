@@ -14,13 +14,23 @@ import http from "http";
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  symbols: (process.env.SYMBOLS || "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT")
+  // Tier 1 — core large-caps, full risk per trade
+  symbols: (process.env.SYMBOLS || "BTC-USDC,ETH-USDC,SOL-USDC,XRP-USDC")
     .split(",").map(s => s.trim()).filter(Boolean),
+
+  // Tier 2 — portfolio holdings + on-the-radar picks, 75% size
+  radarSymbols: (process.env.RADAR_SYMBOLS || "ADA-USDC,LINK-USDC,ONDO-USDC,FET-USDC,SUI-USDC,NEAR-USDC")
+    .split(",").map(s => s.trim()).filter(Boolean),
+
+  // Tier 3 — meme coins, 50% size
+  memeSymbols: (process.env.MEME_SYMBOLS || "PEPE-USDC,SHIB-USDC,DOGE-USDC,BONK-USDC,WIF-USDC,FLOKI-USDC,MOODENG-USDC,NEIRO-USDC,TURBO-USDC,DOGS-USDC")
+    .split(",").map(s => s.trim()).filter(Boolean),
+
   timeframe: process.env.TIMEFRAME || "1H",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "50"),
   riskPerTrade: parseFloat(process.env.RISK_PER_TRADE || "0.02"),  // fraction of portfolio per trade
-  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3", 10),
+  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "6", 10),
   paperTrading: process.env.PAPER_TRADING !== "false",
   okx: {
     apiKey: process.env.OKX_API_KEY || "",
@@ -34,11 +44,15 @@ const CONFIG = {
 const STOP_ATR_MULT   = 2.0;
 const TARGET_ATR_MULT = 4.0;
 
-const CSV_FILE             = "trades.csv";
-const POSITIONS_FILE       = "paper-positions.json";   // paper trades
-const LIVE_POSITIONS_FILE  = "live-positions.json";    // live trades opened by this bot
-const LOCK_FILE            = "bot.lock";
-const SENTIMENT_FILE       = "sentiment.json";         // written by sentiment.js (optional)
+const DATA_DIR             = process.env.DATA_DIR || ".";
+const CSV_FILE             = `${DATA_DIR}/trades.csv`;
+const POSITIONS_FILE       = `${DATA_DIR}/paper-positions.json`;
+const LIVE_POSITIONS_FILE  = `${DATA_DIR}/live-positions.json`;
+const LOCK_FILE            = `${DATA_DIR}/bot.lock`;
+const SENTIMENT_FILE       = `${DATA_DIR}/sentiment.json`;
+const TRENDING_FILE        = `${DATA_DIR}/trending-watchlist.json`;
+
+const MAX_TRENDING_POSITIONS = parseInt(process.env.MAX_TRENDING_POSITIONS || "2", 10);
 
 // Extract base currency from OKX symbol e.g. "BTC-USDT" → "BTC"
 function baseCcy(symbol) { return symbol.split("-")[0]; }
@@ -141,6 +155,61 @@ async function fetchFearGreed() {
   }
 }
 
+// ─── Trending watchlist (CoinGecko, refreshed daily) ─────────────────────────
+
+async function fetchTrending() {
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/search/trending");
+    if (!res.ok) return null;
+    const data = await res.json();
+    const coins = (data?.coins ?? []).map(c => c.item);
+    return coins;
+  } catch {
+    return null;
+  }
+}
+
+async function validateOkxPair(symbol) {
+  try {
+    const url = `${CONFIG.okx.baseUrl}/api/v5/market/ticker?instId=${symbol}`;
+    const res = await fetch(url);
+    if (!res.ok) return false;
+    const data = await res.json();
+    return data.code === "0" && data.data?.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Refreshes once per day. Returns array of { symbol, name, rank, geckoRank }
+async function loadTrendingWatchlist(existingSymbols) {
+  const cached = loadJson(TRENDING_FILE, null);
+  const ageMs  = cached?.updatedAt ? Date.now() - new Date(cached.updatedAt).getTime() : Infinity;
+
+  if (ageMs < 24 * 3_600_000 && cached?.coins?.length) {
+    return cached.coins.filter(c => !existingSymbols.has(c.symbol));
+  }
+
+  console.log("\nRefreshing trending watchlist from CoinGecko...");
+  const coins = await fetchTrending();
+  if (!coins) { console.log("  Trending fetch failed — using cached list"); return cached?.coins ?? []; }
+
+  const validated = [];
+  for (const coin of coins) {
+    const ccy    = coin.symbol.toUpperCase();
+    const symbol = `${ccy}-USDC`;
+    if (existingSymbols.has(symbol)) continue;
+    const valid = await validateOkxPair(symbol);
+    if (!valid) { console.log(`  ${symbol} — not on OKX, skipping`); continue; }
+    validated.push({ symbol, name: coin.name, rank: coin.market_cap_rank ?? 9999, geckoRank: coin.score + 1 });
+    console.log(`  ${symbol} ✓ (trending rank #${coin.score + 1}, market cap rank #${coin.market_cap_rank ?? "?"})`);
+  }
+
+  saveJson(TRENDING_FILE, { updatedAt: new Date().toISOString(), coins: validated });
+  console.log(`  Saved ${validated.length} tradeable trending coins\n`);
+  return validated.filter(c => !existingSymbols.has(c.symbol));
+}
+
 // Written by sentiment.js (optional weekly Apify scrape). Ignored if older than 8 days.
 function loadWeeklySentiment() {
   const s = loadJson(SENTIMENT_FILE, null);
@@ -152,56 +221,77 @@ function loadWeeklySentiment() {
 // ─── Signal ───────────────────────────────────────────────────────────────────
 
 /**
- * Returns { side: "buy"|"sell"|null, reason: string }
+ * Returns { side: "buy"|"sell"|null, reason: string, sizeMultiplier: number }
  *
- * Long  entry: 1H EMA20 > EMA50 AND 4H EMA20 > EMA50 AND RSI 40-65 AND F&G < 85
- * Short entry: 1H EMA20 < EMA50 AND 4H EMA20 < EMA50 AND RSI 35-60 AND F&G > 15
- *              (paper only — spot accounts cannot short)
+ * Long  entry: 1H EMA20 > EMA50 AND RSI 38-70 AND F&G < 85 AND ATR filter AND volume filter
+ *   4H aligned  → full size (1.0×)
+ *   4H opposing → half size (0.5×), still enters
+ * Short entry: 1H EMA20 < EMA50 AND RSI 30-62 AND F&G > 15
+ *   (paper only — spot accounts cannot short)
  */
-function generateSignal(closes, htfCloses, fearGreed, weeklySentiment) {
+function generateSignal(candles, htfCloses, fearGreed, weeklySentiment) {
+  const closes   = candles.map(c => c.close);
   const ema20    = calcEMA(closes, 20);
   const ema50    = calcEMA(closes, 50);
   const rsi14    = calcRSI(closes, 14);
   const htfEma20 = calcEMA(htfCloses, 20);
   const htfEma50 = calcEMA(htfCloses, 50);
+  const atr      = calcATR(candles, 14);
 
-  if (!ema20 || !ema50 || !rsi14 || !htfEma20 || !htfEma50) {
-    return { side: null, reason: "Not enough candle history yet" };
+  if (!ema20 || !ema50 || !rsi14 || !htfEma20 || !htfEma50 || !atr) {
+    return { side: null, reason: "Not enough candle history yet", sizeMultiplier: 1 };
+  }
+
+  // ATR volatility filter — skip dead/choppy markets
+  const price    = closes.at(-1);
+  const atrRatio = atr / price;
+  if (atrRatio < 0.0025) {
+    return { side: null, reason: `Dead market — ATR/price ${(atrRatio * 100).toFixed(3)}% < 0.25%`, sizeMultiplier: 1 };
+  }
+
+  // Volume filter — last CLOSED candle (candles.at(-1) is in-progress) vs 20 prior bars
+  const closedVol = candles.at(-2)?.volume ?? 0;
+  const avgVol    = candles.slice(-22, -2).reduce((s, c) => s + c.volume, 0) / 20;
+  if (avgVol > 0 && closedVol < avgVol * 1.0) {
+    return { side: null, reason: `Low volume — ${closedVol.toFixed(0)} < avg ${avgVol.toFixed(0)}`, sizeMultiplier: 1 };
   }
 
   const trend1h  = ema20 > ema50 ? "up" : "down";
   const trend4h  = htfEma20 > htfEma50 ? "up" : "down";
+  const aligned  = trend1h === trend4h;
   const fg       = fearGreed?.value ?? 50;
   const wBias    = weeklySentiment?.bias ?? "neutral";
 
-  if (trend1h === "up" && trend4h === "up" && rsi14 >= 40 && rsi14 <= 65 && fg < 85 && wBias !== "bearish") {
+  if (trend1h === "up" && rsi14 >= 38 && rsi14 <= 70 && fg < 85 && wBias !== "bearish") {
+    const sizeMultiplier = aligned ? 1.0 : 0.5;
+    const tfLabel = aligned ? "1H+4H" : "1H only (4H opposing — half size)";
     return {
       side: "buy",
-      reason: `EMA20 ${ema20.toFixed(4)} > EMA50 ${ema50.toFixed(4)} on 1H+4H | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      reason: `EMA20 ${ema20.toFixed(4)} > EMA50 ${ema50.toFixed(4)} on ${tfLabel} | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      sizeMultiplier,
     };
   }
 
   // Shorts are paper-only — spot exchange cannot open short positions
-  if (CONFIG.paperTrading && trend1h === "down" && trend4h === "down" && rsi14 >= 35 && rsi14 <= 60 && fg > 15 && wBias !== "bullish") {
+  if (CONFIG.paperTrading && trend1h === "down" && rsi14 >= 30 && rsi14 <= 62 && fg > 15 && wBias !== "bullish") {
+    const sizeMultiplier = aligned ? 1.0 : 0.5;
+    const tfLabel = aligned ? "1H+4H" : "1H only (4H opposing — half size)";
     return {
       side: "sell",
-      reason: `EMA20 ${ema20.toFixed(4)} < EMA50 ${ema50.toFixed(4)} on 1H+4H | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      reason: `EMA20 ${ema20.toFixed(4)} < EMA50 ${ema50.toFixed(4)} on ${tfLabel} | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      sizeMultiplier,
     };
   }
 
-  // Explain why no signal
-  if (trend1h !== trend4h) {
-    return { side: null, reason: `Trends misaligned — 1H ${trend1h}, 4H ${trend4h}` };
+  if (trend1h === "up" && (rsi14 < 38 || rsi14 > 70)) {
+    return { side: null, reason: `Uptrend but RSI ${rsi14.toFixed(1)} outside long window (38–70)`, sizeMultiplier: 1 };
   }
-  if (trend1h === "up" && (rsi14 < 40 || rsi14 > 65)) {
-    return { side: null, reason: `Uptrend but RSI ${rsi14.toFixed(1)} outside long window (40–65)` };
+  if (trend1h === "down" && (rsi14 < 30 || rsi14 > 62)) {
+    return { side: null, reason: `Downtrend but RSI ${rsi14.toFixed(1)} outside short window (30–62)`, sizeMultiplier: 1 };
   }
-  if (trend1h === "down" && (rsi14 < 35 || rsi14 > 60)) {
-    return { side: null, reason: `Downtrend but RSI ${rsi14.toFixed(1)} outside short window (35–60)` };
-  }
-  if (fg >= 85) return { side: null, reason: `Extreme greed (F&G ${fg}) — waiting for pullback` };
-  if (fg <= 15) return { side: null, reason: `Extreme fear (F&G ${fg}) — waiting for stabilisation` };
-  return { side: null, reason: `No setup — trend ${trend1h}, RSI ${rsi14.toFixed(1)}, F&G ${fg}` };
+  if (fg >= 85) return { side: null, reason: `Extreme greed (F&G ${fg}) — waiting for pullback`, sizeMultiplier: 1 };
+  if (fg <= 15) return { side: null, reason: `Extreme fear (F&G ${fg}) — waiting for stabilisation`, sizeMultiplier: 1 };
+  return { side: null, reason: `No setup — trend ${trend1h}, RSI ${rsi14.toFixed(1)}, F&G ${fg}`, sizeMultiplier: 1 };
 }
 
 // ─── Paper position management ────────────────────────────────────────────────
@@ -519,8 +609,9 @@ function countTodaysTrades() {
 
 // ─── Analyse one symbol ───────────────────────────────────────────────────────
 
-async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment) {
+async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tierMultiplier = 1.0) {
   console.log(`\n── ${symbol} ${"─".repeat(Math.max(0, 44 - symbol.length))}`);
+  if (tierMultiplier < 1) console.log(`  Tier multiplier: ${tierMultiplier}× size`);
 
   const [candles, htfCandles] = await Promise.all([
     fetchCandles(symbol, CONFIG.timeframe, 200),
@@ -550,7 +641,7 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment) {
   const positions = loadJson(POSITIONS_FILE, []);
   if (positions.some(p => p.symbol === symbol)) return false;
 
-  const signal = generateSignal(closes, htfCloses, fearGreed, weeklySentiment);
+  const signal = generateSignal(candles, htfCloses, fearGreed, weeklySentiment);
   console.log(`  Signal: ${signal.side ? signal.side.toUpperCase() : "NONE"} — ${signal.reason}`);
 
   if (!signal.side) {
@@ -558,7 +649,7 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment) {
     return false;
   }
 
-  const tradeSize = Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD);
+  const tradeSize = Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier;
 
   if (CONFIG.paperTrading) {
     const pos = openPaperPosition(symbol, signal.side, price, atr, tradeSize);
@@ -624,12 +715,25 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment) {
 async function run() {
   initCsv();
 
+  // Build set of all static watchlist symbols for dedup
+  const staticSymbols = new Set([
+    ...CONFIG.symbols,
+    ...CONFIG.radarSymbols,
+    ...CONFIG.memeSymbols,
+  ]);
+
+  // Load trending watchlist (refreshes from CoinGecko once per day)
+  const trendingCoins = await loadTrendingWatchlist(staticSymbols).catch(() => []);
+
   console.log("═══════════════════════════════════════════");
   console.log("  Claude Trading Bot — OKX");
   console.log(`  ${new Date().toISOString()}`);
   console.log(`  Mode    : ${CONFIG.paperTrading ? "PAPER TRADING" : "LIVE TRADING"}`);
-  console.log(`  Symbols : ${CONFIG.symbols.join(", ")}`);
-  console.log(`  Strategy: EMA 20/50 Trend + Fear & Greed`);
+  console.log(`  Tier 1  : ${CONFIG.symbols.join(", ")}`);
+  console.log(`  Radar   : ${CONFIG.radarSymbols.join(", ")}`);
+  console.log(`  Meme    : ${CONFIG.memeSymbols.join(", ")}`);
+  console.log(`  Trending: ${trendingCoins.map(c => c.symbol).join(", ") || "none"}`);
+  console.log(`  Strategy: EMA 20/50 Trend + Fear & Greed + ATR + Volume`);
   console.log("═══════════════════════════════════════════");
 
   const [fearGreed] = await Promise.all([fetchFearGreed()]);
@@ -641,15 +745,48 @@ async function run() {
   let todayCount = countTodaysTrades();
   console.log(`Trades today: ${todayCount}/${CONFIG.maxTradesPerDay}`);
 
-  for (const symbol of CONFIG.symbols) {
+  const tiers = [
+    { label: "── TIER 1: Core ──────────────────────────", symbols: CONFIG.symbols,                    mult: 1.00 },
+    { label: "── TIER 2: On the Radar ──────────────────", symbols: CONFIG.radarSymbols,               mult: 0.75 },
+    { label: "── TIER 3: Meme Coins ────────────────────", symbols: CONFIG.memeSymbols,                mult: 0.50 },
+    { label: "── TIER 4: Trending (CoinGecko) ──────────", symbols: trendingCoins.map(c => c.symbol), mult: 0.30 },
+  ];
+
+  for (const tier of tiers) {
     todayCount = countTodaysTrades();
     if (todayCount >= CONFIG.maxTradesPerDay) {
       console.log(`\nDaily cap hit — done for today.`);
       break;
     }
-    await analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment).catch(err =>
-      console.log(`  ${symbol} error: ${err.message}`)
-    );
+
+    // Tier 4: cap at MAX_TRENDING_POSITIONS open at once
+    if (tier.label.includes("TIER 4")) {
+      const openTrending = loadJson(POSITIONS_FILE, [])
+        .filter(p => trendingCoins.some(c => c.symbol === p.symbol)).length;
+      if (openTrending >= MAX_TRENDING_POSITIONS) {
+        console.log(`\n${tier.label}`);
+        console.log(`  Max trending positions (${MAX_TRENDING_POSITIONS}) already open — skipping`);
+        continue;
+      }
+    }
+
+    console.log(`\n${tier.label}`);
+    for (const symbol of tier.symbols) {
+      todayCount = countTodaysTrades();
+      if (todayCount >= CONFIG.maxTradesPerDay) break;
+
+      // Re-check trending cap per symbol
+      if (tier.label.includes("TIER 4")) {
+        const openTrending = loadJson(POSITIONS_FILE, [])
+          .filter(p => trendingCoins.some(c => c.symbol === p.symbol)).length;
+        if (openTrending >= MAX_TRENDING_POSITIONS) break;
+        console.log(`  [TRENDING] ${trendingCoins.find(c => c.symbol === symbol)?.name} — CoinGecko rank #${trendingCoins.find(c => c.symbol === symbol)?.geckoRank}`);
+      }
+
+      await analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tier.mult).catch(err =>
+        console.log(`  ${symbol} error: ${err.message}`)
+      );
+    }
   }
 
   console.log("\n═══════════════════════════════════════════\n");
