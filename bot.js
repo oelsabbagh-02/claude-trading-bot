@@ -297,7 +297,7 @@ function loadWeeklySentiment() {
  * Short entry: 1H EMA20 < EMA50 AND RSI 30-62 AND F&G > 15
  *   (paper only — spot accounts cannot short)
  */
-function generateSignal(candles, htfCloses, fearGreed, weeklySentiment) {
+function generateSignal(candles, htfCloses, fearGreed, weeklySentiment, mode = "trend") {
   const closes   = candles.map(c => c.close);
   const ema20    = calcEMA(closes, 20);
   const ema50    = calcEMA(closes, 50);
@@ -330,6 +330,33 @@ function generateSignal(candles, htfCloses, fearGreed, weeklySentiment) {
   const fg       = fearGreed?.value ?? 50;
   const wBias    = weeklySentiment?.bias ?? "neutral";
 
+  // ── Momentum mode (Tier 4 trending) — breakout entry, no RSI ceiling ────────
+  if (mode === "momentum") {
+    if (trend1h !== "up") {
+      return { side: null, reason: `Momentum: trend not up (EMA20<EMA50)`, sizeMultiplier: 1 };
+    }
+    if (fg >= 90) {
+      return { side: null, reason: `Momentum: extreme greed (F&G ${fg})`, sizeMultiplier: 1 };
+    }
+    if (wBias === "bearish") {
+      return { side: null, reason: `Momentum: weekly sentiment bearish`, sizeMultiplier: 1 };
+    }
+    // Breakout: last closed candle's close must exceed prior 20-bar high
+    const prior20High = Math.max(...candles.slice(-22, -2).map(c => c.high));
+    const closedHigh  = candles.at(-2)?.close ?? 0;
+    if (closedHigh <= prior20High) {
+      return { side: null, reason: `Momentum: no breakout (close ${closedHigh.toFixed(6)} ≤ 20-bar high ${prior20High.toFixed(6)})`, sizeMultiplier: 1 };
+    }
+    return {
+      side: "buy",
+      reason: `Momentum BREAKOUT — close ${closedHigh.toFixed(6)} > 20-bar high ${prior20High.toFixed(6)} | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      sizeMultiplier: 1.0,
+      stopMult: 1.5,    // tighter stop for pump plays
+      targetMult: 3.0,  // 1:2 R:R preserved at the tighter stop
+    };
+  }
+
+  // ── Trend mode (default for Tiers 1-3) ──────────────────────────────────────
   if (trend1h === "up" && rsi14 >= 38 && rsi14 <= 70 && fg < 85 && wBias !== "bearish") {
     const sizeMultiplier = aligned ? 1.0 : 0.5;
     const tfLabel = aligned ? "1H+4H" : "1H only (4H opposing — half size)";
@@ -364,10 +391,15 @@ function generateSignal(candles, htfCloses, fearGreed, weeklySentiment) {
 
 // ─── Paper position management ────────────────────────────────────────────────
 
-function openPaperPosition(symbol, side, price, atr, size) {
+function openPaperPosition(symbol, side, price, atr, size, opts = {}) {
+  if (!symbol.endsWith("-USDC")) {
+    throw new Error(`Refusing to open non-USDC paper position: ${symbol}`);
+  }
+  const stopMult   = opts.stopMult   ?? STOP_ATR_MULT;
+  const targetMult = opts.targetMult ?? TARGET_ATR_MULT;
   const isLong     = side === "buy";
-  const stopLoss   = isLong ? price - STOP_ATR_MULT * atr   : price + STOP_ATR_MULT * atr;
-  const takeProfit = isLong ? price + TARGET_ATR_MULT * atr : price - TARGET_ATR_MULT * atr;
+  const stopLoss   = isLong ? price - stopMult * atr   : price + stopMult * atr;
+  const takeProfit = isLong ? price + targetMult * atr : price - targetMult * atr;
   const position   = {
     id: `PAPER-${Date.now()}`,
     symbol, side,
@@ -459,11 +491,16 @@ async function okxRequest(method, path, bodyObj = null) {
   return data;
 }
 
-async function placeLiveOrder(symbol, side, sizeUSD, price, atr) {
+async function placeLiveOrder(symbol, side, sizeUSD, price, atr, opts = {}) {
+  if (!symbol.endsWith("-USDC")) {
+    throw new Error(`Refusing to place non-USDC live order: ${symbol}`);
+  }
+  const stopMult   = opts.stopMult   ?? STOP_ATR_MULT;
+  const targetMult = opts.targetMult ?? TARGET_ATR_MULT;
   const isLong     = side === "buy";
   const sz         = (sizeUSD / price).toFixed(8);
-  const stopLoss   = isLong ? price - STOP_ATR_MULT * atr   : price + STOP_ATR_MULT * atr;
-  const takeProfit = isLong ? price + TARGET_ATR_MULT * atr : price - TARGET_ATR_MULT * atr;
+  const stopLoss   = isLong ? price - stopMult * atr   : price + stopMult * atr;
+  const takeProfit = isLong ? price + targetMult * atr : price - targetMult * atr;
 
   const order   = await okxRequest("POST", "/api/v5/trade/order", {
     instId: symbol, tdMode: "cash", side, ordType: "market", sz,
@@ -684,9 +721,15 @@ function countTodaysTrades() {
 
 // ─── Analyse one symbol ───────────────────────────────────────────────────────
 
-async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tierMultiplier = 1.0) {
+async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tierMultiplier = 1.0, mode = "trend") {
+  // Hard guard — bot will never trade non-USDC pairs
+  if (!symbol.endsWith("-USDC")) {
+    console.log(`\n  Skipping ${symbol} — only USDC pairs allowed`);
+    return false;
+  }
   console.log(`\n── ${symbol} ${"─".repeat(Math.max(0, 44 - symbol.length))}`);
   if (tierMultiplier < 1) console.log(`  Tier multiplier: ${tierMultiplier}× size`);
+  if (mode !== "trend")   console.log(`  Mode: ${mode.toUpperCase()}`);
 
   const [candles, htfCandles] = await Promise.all([
     fetchCandles(symbol, CONFIG.timeframe, 200),
@@ -716,7 +759,7 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
   const positions = loadJson(POSITIONS_FILE, []);
   if (positions.some(p => p.symbol === symbol)) return false;
 
-  const signal = generateSignal(candles, htfCloses, fearGreed, weeklySentiment);
+  const signal = generateSignal(candles, htfCloses, fearGreed, weeklySentiment, mode);
   console.log(`  Signal: ${signal.side ? signal.side.toUpperCase() : "NONE"} — ${signal.reason}`);
 
   if (!signal.side) {
@@ -726,8 +769,10 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
 
   const tradeSize = Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier;
 
+  const stopOpts = { stopMult: signal.stopMult, targetMult: signal.targetMult };
+
   if (CONFIG.paperTrading) {
-    const pos = openPaperPosition(symbol, signal.side, price, atr, tradeSize);
+    const pos = openPaperPosition(symbol, signal.side, price, atr, tradeSize, stopOpts);
     console.log(`  PAPER ${signal.side.toUpperCase()} $${tradeSize.toFixed(2)} @ $${price.toFixed(4)}`);
     console.log(`        SL $${pos.stopLoss.toFixed(4)} | TP $${pos.takeProfit.toFixed(4)}`);
     logOpenTrade({ symbol, side: signal.side, price, size: tradeSize, orderId: pos.id, paperTrading: true });
@@ -761,7 +806,7 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
   }
 
   try {
-    const { orderId, algoId, stopLoss, takeProfit } = await placeLiveOrder(symbol, "buy", tradeSize, price, atr);
+    const { orderId, algoId, stopLoss, takeProfit } = await placeLiveOrder(symbol, "buy", tradeSize, price, atr, stopOpts);
     console.log(`  LIVE BUY $${tradeSize.toFixed(2)} @ $${price.toFixed(4)} | Order ${orderId}`);
     console.log(`        SL $${stopLoss.toFixed(4)} | TP $${takeProfit.toFixed(4)}`);
 
@@ -787,8 +832,39 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+// Mark-to-market close any stored positions whose symbol isn't -USDC.
+// Handles legacy USDT entries from before the USDC-only rule.
+async function purgeStaleNonUsdcPositions() {
+  for (const [file, label] of [[POSITIONS_FILE, "PAPER"], [LIVE_POSITIONS_FILE, "LIVE"]]) {
+    const positions = loadJson(file, []);
+    const stale     = positions.filter(p => p.symbol && !p.symbol.endsWith("-USDC"));
+    if (!stale.length) continue;
+
+    console.log(`\nPurging ${stale.length} stale non-USDC ${label} position(s):`);
+    for (const pos of stale) {
+      let exitPrice = pos.entryPrice;
+      try {
+        const candles = await fetchCandles(pos.symbol, "1H", 2);
+        exitPrice = candles.at(-1)?.close ?? pos.entryPrice;
+      } catch {}
+      const isLong = pos.side === "buy";
+      const pnlUSD = isLong
+        ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * pos.size
+        : ((pos.entryPrice - exitPrice) / pos.entryPrice) * pos.size;
+      const pnlPct = (pnlUSD / pos.size) * 100;
+      const holdH  = ((Date.now() - new Date(pos.openedAt).getTime()) / 3_600_000).toFixed(1);
+      console.log(`  ${pos.side.toUpperCase()} ${pos.symbol} @ $${pos.entryPrice} → $${exitPrice.toFixed(4)} | P&L ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
+      if (label === "PAPER") logClosedTrade(pos, exitPrice, pnlUSD, pnlPct, holdH, "Purged: non-USDC pair no longer supported");
+    }
+    saveJson(file, positions.filter(p => p.symbol && p.symbol.endsWith("-USDC")));
+  }
+}
+
 async function run() {
   initCsv();
+
+  // Clean out any legacy USDT/other-quote positions before doing anything
+  await purgeStaleNonUsdcPositions();
 
   // Auto-refresh static tiers weekly from CoinGecko (env vars still override)
   const dynamic = await loadDynamicWatchlists().catch(() => null);
@@ -860,7 +936,8 @@ async function run() {
         console.log(`  [TRENDING] ${trendingCoins.find(c => c.symbol === symbol)?.name} — CoinGecko rank #${trendingCoins.find(c => c.symbol === symbol)?.geckoRank}`);
       }
 
-      await analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tier.mult).catch(err =>
+      const mode = tier.label.includes("TIER 4") ? "momentum" : "trend";
+      await analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tier.mult, mode).catch(err =>
         console.log(`  ${symbol} error: ${err.message}`)
       );
     }
