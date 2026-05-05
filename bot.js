@@ -51,6 +51,7 @@ const LIVE_POSITIONS_FILE  = `${DATA_DIR}/live-positions.json`;
 const LOCK_FILE            = `${DATA_DIR}/bot.lock`;
 const SENTIMENT_FILE       = `${DATA_DIR}/sentiment.json`;
 const TRENDING_FILE        = `${DATA_DIR}/trending-watchlist.json`;
+const WATCHLISTS_FILE      = `${DATA_DIR}/watchlists.json`;
 
 const MAX_TRENDING_POSITIONS = parseInt(process.env.MAX_TRENDING_POSITIONS || "2", 10);
 
@@ -208,6 +209,73 @@ async function loadTrendingWatchlist(existingSymbols) {
   saveJson(TRENDING_FILE, { updatedAt: new Date().toISOString(), coins: validated });
   console.log(`  Saved ${validated.length} tradeable trending coins\n`);
   return validated.filter(c => !existingSymbols.has(c.symbol));
+}
+
+// ─── Auto-refresh static watchlists (weekly from CoinGecko) ──────────────────
+
+const STABLES_AND_WRAPPED = new Set([
+  "USDT", "USDC", "DAI", "TUSD", "USDS", "FDUSD", "PYUSD", "USDE", "USD1",
+  "WBTC", "WETH", "WBETH", "WSTETH", "STETH", "CBBTC", "CBETH", "RETH",
+  "STETHWBETH", "WEETH", "WSOL", "JUPSOL", "JITOSOL",
+]);
+
+async function fetchCoinGeckoMarkets({ category = null, perPage = 50, page = 1 } = {}) {
+  try {
+    const cat = category ? `&category=${category}` : "";
+    const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=${page}${cat}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+// Returns first N coins from `coins` that have a tradeable OKX-USDC pair and aren't stablecoins
+async function pickTradeableUsdc(coins, n) {
+  const picks = [];
+  for (const c of coins) {
+    if (picks.length >= n) break;
+    const ccy = c.symbol.toUpperCase();
+    if (STABLES_AND_WRAPPED.has(ccy)) continue;
+    const symbol = `${ccy}-USDC`;
+    const ok = await validateOkxPair(symbol);
+    if (ok) picks.push(symbol);
+  }
+  return picks;
+}
+
+// Refreshes once per week. Returns { core, radar, meme } arrays of OKX-USDC symbols.
+async function loadDynamicWatchlists() {
+  const cached = loadJson(WATCHLISTS_FILE, null);
+  const ageMs  = cached?.updatedAt ? Date.now() - new Date(cached.updatedAt).getTime() : Infinity;
+  const TTL    = 7 * 24 * 3_600_000;
+
+  if (ageMs < TTL && cached?.core?.length) return cached;
+
+  console.log("\nRefreshing static watchlists from CoinGecko (weekly)...");
+  const [topMarket, memes] = await Promise.all([
+    fetchCoinGeckoMarkets({ perPage: 100 }),
+    fetchCoinGeckoMarkets({ category: "meme-token", perPage: 50 }),
+  ]);
+
+  if (!topMarket || !memes) {
+    console.log("  CoinGecko fetch failed — using cached/default lists");
+    return cached ?? null;
+  }
+
+  // Tier 1: top 4 by market cap (excluding stables/wrapped)
+  const core  = await pickTradeableUsdc(topMarket, 4);
+  // Tier 2: ranks 5-50 by market cap, top 6 with OKX-USDC pairs
+  const radar = await pickTradeableUsdc(topMarket.slice(4, 50), 6);
+  // Tier 3: top 10 memes by market cap with OKX-USDC pairs
+  const meme  = await pickTradeableUsdc(memes, 10);
+
+  console.log(`  Core (T1) : ${core.join(", ")}`);
+  console.log(`  Radar (T2): ${radar.join(", ")}`);
+  console.log(`  Meme (T3) : ${meme.join(", ")}`);
+
+  const result = { updatedAt: new Date().toISOString(), core, radar, meme };
+  saveJson(WATCHLISTS_FILE, result);
+  return result;
 }
 
 // Written by sentiment.js (optional weekly Apify scrape). Ignored if older than 8 days.
@@ -722,12 +790,14 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
 async function run() {
   initCsv();
 
+  // Auto-refresh static tiers weekly from CoinGecko (env vars still override)
+  const dynamic = await loadDynamicWatchlists().catch(() => null);
+  const tier1 = process.env.SYMBOLS         ? CONFIG.symbols      : (dynamic?.core  ?? CONFIG.symbols);
+  const tier2 = process.env.RADAR_SYMBOLS   ? CONFIG.radarSymbols : (dynamic?.radar ?? CONFIG.radarSymbols);
+  const tier3 = process.env.MEME_SYMBOLS    ? CONFIG.memeSymbols  : (dynamic?.meme  ?? CONFIG.memeSymbols);
+
   // Build set of all static watchlist symbols for dedup
-  const staticSymbols = new Set([
-    ...CONFIG.symbols,
-    ...CONFIG.radarSymbols,
-    ...CONFIG.memeSymbols,
-  ]);
+  const staticSymbols = new Set([...tier1, ...tier2, ...tier3]);
 
   // Load trending watchlist (refreshes from CoinGecko once per day)
   const trendingCoins = await loadTrendingWatchlist(staticSymbols).catch(() => []);
@@ -736,9 +806,9 @@ async function run() {
   console.log("  Claude Trading Bot — OKX");
   console.log(`  ${new Date().toISOString()}`);
   console.log(`  Mode    : ${CONFIG.paperTrading ? "PAPER TRADING" : "LIVE TRADING"}`);
-  console.log(`  Tier 1  : ${CONFIG.symbols.join(", ")}`);
-  console.log(`  Radar   : ${CONFIG.radarSymbols.join(", ")}`);
-  console.log(`  Meme    : ${CONFIG.memeSymbols.join(", ")}`);
+  console.log(`  Tier 1  : ${tier1.join(", ")}`);
+  console.log(`  Radar   : ${tier2.join(", ")}`);
+  console.log(`  Meme    : ${tier3.join(", ")}`);
   console.log(`  Trending: ${trendingCoins.map(c => c.symbol).join(", ") || "none"}`);
   console.log(`  Strategy: EMA 20/50 Trend + Fear & Greed + ATR + Volume`);
   console.log("═══════════════════════════════════════════");
@@ -753,9 +823,9 @@ async function run() {
   console.log(`Trades today: ${todayCount}/${CONFIG.maxTradesPerDay}`);
 
   const tiers = [
-    { label: "── TIER 1: Core ──────────────────────────", symbols: CONFIG.symbols,                    mult: 1.00 },
-    { label: "── TIER 2: On the Radar ──────────────────", symbols: CONFIG.radarSymbols,               mult: 0.75 },
-    { label: "── TIER 3: Meme Coins ────────────────────", symbols: CONFIG.memeSymbols,                mult: 0.50 },
+    { label: "── TIER 1: Core ──────────────────────────", symbols: tier1,                            mult: 1.00 },
+    { label: "── TIER 2: On the Radar ──────────────────", symbols: tier2,                            mult: 0.75 },
+    { label: "── TIER 3: Meme Coins ────────────────────", symbols: tier3,                            mult: 0.50 },
     { label: "── TIER 4: Trending (CoinGecko) ──────────", symbols: trendingCoins.map(c => c.symbol), mult: 0.30 },
   ];
 
