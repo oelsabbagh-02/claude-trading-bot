@@ -32,6 +32,9 @@ const CONFIG = {
   riskPerTrade: parseFloat(process.env.RISK_PER_TRADE || "0.02"),  // fraction of portfolio per trade
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "6", 10),
   paperTrading: process.env.PAPER_TRADING !== "false",
+  // "longs" = spot, buys only (safe for €500 launch)
+  // "perps" = USDC-margined swaps, longs + shorts with leverage (NOT YET IMPLEMENTED)
+  tradeMode: (process.env.TRADE_MODE || "longs").toLowerCase(),
   okx: {
     apiKey: process.env.OKX_API_KEY || "",
     secretKey: process.env.OKX_SECRET_KEY || "",
@@ -767,6 +770,14 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
     return false;
   }
 
+  // Mode gate: in longs mode, drop short signals before they reach paper or live.
+  // Keeps paper stats representative of what live (spot) will actually take.
+  if (CONFIG.tradeMode === "longs" && signal.side === "sell") {
+    console.log("  Short signal skipped — TRADE_MODE=longs");
+    logBlockedTrade({ symbol, reason: "short skipped (longs-only mode)", paperTrading: CONFIG.paperTrading });
+    return false;
+  }
+
   const tradeSize = Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier;
 
   const stopOpts = { stopMult: signal.stopMult, targetMult: signal.targetMult };
@@ -863,6 +874,16 @@ async function purgeStaleNonUsdcPositions() {
 async function run() {
   initCsv();
 
+  // Validate trade mode before doing anything else
+  if (!["longs", "perps"].includes(CONFIG.tradeMode)) {
+    console.error(`Invalid TRADE_MODE="${CONFIG.tradeMode}". Must be "longs" or "perps".`);
+    process.exit(1);
+  }
+  if (CONFIG.tradeMode === "perps" && !CONFIG.paperTrading) {
+    console.error("TRADE_MODE=perps not yet implemented for live. Set TRADE_MODE=longs or PAPER_TRADING=true.");
+    process.exit(1);
+  }
+
   // Clean out any legacy USDT/other-quote positions before doing anything
   await purgeStaleNonUsdcPositions();
 
@@ -881,7 +902,7 @@ async function run() {
   console.log("═══════════════════════════════════════════");
   console.log("  Claude Trading Bot — OKX");
   console.log(`  ${new Date().toISOString()}`);
-  console.log(`  Mode    : ${CONFIG.paperTrading ? "PAPER TRADING" : "LIVE TRADING"}`);
+  console.log(`  Mode    : ${CONFIG.paperTrading ? "PAPER TRADING" : "LIVE TRADING"} (${CONFIG.tradeMode.toUpperCase()})`);
   console.log(`  Tier 1  : ${tier1.join(", ")}`);
   console.log(`  Radar   : ${tier2.join(", ")}`);
   console.log(`  Meme    : ${tier3.join(", ")}`);
@@ -995,6 +1016,7 @@ function buildSummaryJson() {
   return {
     time: new Date().toISOString(),
     mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
+    tradeMode: CONFIG.tradeMode,
     closedTrades: closed.length,
     wins:   wins.length,
     losses: losses.length,
