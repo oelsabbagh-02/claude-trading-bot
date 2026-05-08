@@ -39,7 +39,7 @@ const CONFIG = {
     apiKey: process.env.OKX_API_KEY || "",
     secretKey: process.env.OKX_SECRET_KEY || "",
     passphrase: process.env.OKX_PASSPHRASE || "",
-    baseUrl: "https://www.okx.com",
+    baseUrl: process.env.OKX_BASE_URL || "https://my.okx.com",
   },
 };
 
