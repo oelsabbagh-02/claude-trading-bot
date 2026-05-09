@@ -35,6 +35,15 @@ const CONFIG = {
   // "longs" = spot, buys only (safe for €500 launch)
   // "perps" = USDC-margined swaps, longs + shorts with leverage (NOT YET IMPLEMENTED)
   tradeMode: (process.env.TRADE_MODE || "longs").toLowerCase(),
+  // Cron cadence in minutes (Railway-mounted process loops itself).
+  // 60 = hourly (legacy). 15 = quarter-hour for tighter exits + faster setup detection.
+  cycleMinutes: parseInt(process.env.CYCLE_MINUTES || "60", 10),
+  // Skip Asian-session thin liquidity (00:00–06:00 UTC).
+  // Set "false" to disable. Reduces ACE-style top-buying on wide spreads.
+  skipAsianSession: process.env.SKIP_ASIAN_SESSION !== "false",
+  // Auto-move stops to breakeven after 1.5× ATR favorable move on live positions.
+  // Locks in the "free trade" — worst case 0, lets winners run unbounded with TP intact.
+  breakevenStopEnabled: process.env.BREAKEVEN_STOP !== "false",
   okx: {
     apiKey: process.env.OKX_API_KEY || "",
     secretKey: process.env.OKX_SECRET_KEY || "",
@@ -360,23 +369,45 @@ function generateSignal(candles, htfCloses, fearGreed, weeklySentiment, mode = "
   }
 
   // ── Trend mode (default for Tiers 1-3) ──────────────────────────────────────
+  // Conviction scoring: count confluence factors → scale size up/down.
+  // Each factor adds independent edge; more factors = higher EV setup.
+  function scoreConviction(side) {
+    let n = 0;
+    if (aligned) n++;                                       // 1H+4H trend match
+    if (side === "buy"  && rsi14 >= 45 && rsi14 <= 65) n++; // RSI sweet spot for longs
+    if (side === "sell" && rsi14 >= 35 && rsi14 <= 55) n++; // RSI sweet spot for shorts
+    if (fg >= 35 && fg <= 65) n++;                          // F&G not at extremes
+    if (avgVol > 0 && closedVol > avgVol * 1.5) n++;        // strong volume confirmation
+    if (side === "buy"  && wBias === "bullish") n++;
+    if (side === "sell" && wBias === "bearish") n++;
+    return n;
+  }
+  function convictionMultiplier(score) {
+    if (score <= 0) return 0.5;       // weak (1H only, no bonuses)  — half size
+    if (score === 1) return 1.0;      // baseline (one factor)        — normal
+    if (score <= 3) return 1.5;       // good (2-3 factors)           — 1.5× boost
+    return 2.0;                       // A+ setup (4-5 factors)       — double down
+  }
+
   if (trend1h === "up" && rsi14 >= 38 && rsi14 <= 70 && fg < 85 && wBias !== "bearish") {
-    const sizeMultiplier = aligned ? 1.0 : 0.5;
-    const tfLabel = aligned ? "1H+4H" : "1H only (4H opposing — half size)";
+    const score = scoreConviction("buy");
+    const sizeMultiplier = convictionMultiplier(score);
+    const tfLabel = aligned ? "1H+4H" : "1H only";
     return {
       side: "buy",
-      reason: `EMA20 ${ema20.toFixed(4)} > EMA50 ${ema50.toFixed(4)} on ${tfLabel} | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      reason: `EMA20>${ema50.toFixed(4)} on ${tfLabel} | RSI ${rsi14.toFixed(1)} | F&G ${fg} | conviction ${score}/5 → ${sizeMultiplier}× size`,
       sizeMultiplier,
     };
   }
 
   // Shorts are paper-only — spot exchange cannot open short positions
   if (CONFIG.paperTrading && trend1h === "down" && rsi14 >= 30 && rsi14 <= 62 && fg > 15 && wBias !== "bullish") {
-    const sizeMultiplier = aligned ? 1.0 : 0.5;
-    const tfLabel = aligned ? "1H+4H" : "1H only (4H opposing — half size)";
+    const score = scoreConviction("sell");
+    const sizeMultiplier = convictionMultiplier(score);
+    const tfLabel = aligned ? "1H+4H" : "1H only";
     return {
       side: "sell",
-      reason: `EMA20 ${ema20.toFixed(4)} < EMA50 ${ema50.toFixed(4)} on ${tfLabel} | RSI ${rsi14.toFixed(1)} | F&G ${fg}`,
+      reason: `EMA20<${ema50.toFixed(4)} on ${tfLabel} | RSI ${rsi14.toFixed(1)} | F&G ${fg} | conviction ${score}/5 → ${sizeMultiplier}× size`,
       sizeMultiplier,
     };
   }
@@ -566,6 +597,89 @@ async function fetchSpotBalances() {
 async function fetchHoldingUSD(symbol) {
   const balances = await fetchSpotBalances();
   return balances[baseCcy(symbol)]?.usdValue ?? 0;
+}
+
+// After 1.5× ATR favorable move, swap the OCO so stop = entry price.
+// Worst case becomes "free trade" (0% loss); upside via TP is unchanged.
+// Captures the asymmetric "winners run, losers cap at 0" pattern.
+async function tryBreakevenStops() {
+  if (!CONFIG.breakevenStopEnabled || CONFIG.paperTrading) return;
+  const positions = loadJson(LIVE_POSITIONS_FILE, []);
+  if (!positions.length) return;
+
+  const updated = [];
+  let changed   = false;
+
+  for (const pos of positions) {
+    if (pos.breakevenSet || !pos.algoId) {
+      updated.push(pos);
+      continue;
+    }
+    const isLong = pos.side === "buy";
+    // Recover ATR-at-entry from the original stop distance (was 2× ATR or 1.5× for momentum)
+    const stopDist = Math.abs(pos.entryPrice - pos.stopLoss);
+    const atrAtEntry = stopDist / 2; // best-effort; tier-4 momentum uses 1.5× but 2× is conservative
+
+    let price;
+    try {
+      const t = await okxRequest("GET", `/api/v5/market/ticker?instId=${pos.symbol}`);
+      price = parseFloat(t.data?.[0]?.last);
+    } catch {
+      updated.push(pos);
+      continue;
+    }
+    const move = isLong ? price - pos.entryPrice : pos.entryPrice - price;
+    if (move < atrAtEntry * 1.5) {
+      updated.push(pos);
+      continue;
+    }
+
+    // Cancel old OCO, place new one with stop at entry. Risk: brief unprotected window.
+    try {
+      await okxRequest("POST", "/api/v5/trade/cancel-algos", [{ algoId: pos.algoId, instId: pos.symbol }]);
+    } catch (err) {
+      console.log(`  Breakeven cancel failed for ${pos.symbol}: ${err.message}`);
+      updated.push(pos);
+      continue;
+    }
+
+    const sz = (pos.size / pos.entryPrice).toFixed(8);
+    let newAlgoId = null;
+    try {
+      const algo = await okxRequest("POST", "/api/v5/trade/order-algo", {
+        instId: pos.symbol, tdMode: "cash",
+        side: isLong ? "sell" : "buy",
+        ordType: "oco", sz, tgtCcy: "base_ccy",
+        tpTriggerPx: pos.takeProfit.toFixed(4), tpOrdPx: "-1",
+        slTriggerPx: pos.entryPrice.toFixed(4),  slOrdPx: "-1",
+      });
+      newAlgoId = algo.data?.[0]?.algoId ?? null;
+    } catch (err) {
+      console.log(`  Breakeven OCO failed for ${pos.symbol}: ${err.message} — retrying with stop-only`);
+      try {
+        const sl = await okxRequest("POST", "/api/v5/trade/order-algo", {
+          instId: pos.symbol, tdMode: "cash",
+          side: isLong ? "sell" : "buy",
+          ordType: "conditional", sz, tgtCcy: "base_ccy",
+          slTriggerPx: pos.entryPrice.toFixed(4), slOrdPx: "-1",
+        });
+        newAlgoId = sl.data?.[0]?.algoId ?? null;
+      } catch (err2) {
+        console.log(`  Breakeven fallback also failed: ${err2.message}`);
+      }
+    }
+
+    if (newAlgoId) {
+      console.log(`  ✓ ${pos.symbol} stop moved to breakeven @ $${pos.entryPrice.toFixed(4)} (price $${price.toFixed(6)}, +${move.toFixed(6)})`);
+      updated.push({ ...pos, algoId: newAlgoId, stopLoss: pos.entryPrice, breakevenSet: true });
+    } else {
+      console.log(`  ⚠ ${pos.symbol} unprotected — original OCO cancelled, replacement failed; reconcile will catch`);
+      updated.push({ ...pos, algoId: null });
+    }
+    changed = true;
+  }
+
+  if (changed) saveJson(LIVE_POSITIONS_FILE, updated);
 }
 
 // Check if bot-opened live positions have been closed by their OCO orders
@@ -835,8 +949,10 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
 
   if (!CONFIG.okx.apiKey) { console.log("  Missing OKX credentials"); return false; }
 
-  // Check if any bot-opened positions were closed by their OCO orders
+  // Check if any bot-opened positions were closed by their OCO orders;
+  // and try moving stops to breakeven on positions deep in profit.
   await checkLiveExits();
+  await tryBreakevenStops();
 
   // Guard 1: bot already tracking an open position for this symbol
   const livePositions = loadJson(LIVE_POSITIONS_FILE, []);
@@ -945,7 +1061,21 @@ async function run() {
   console.log(`  Meme    : ${tier3.join(", ")}`);
   console.log(`  Trending: ${trendingCoins.map(c => c.symbol).join(", ") || "none"}`);
   console.log(`  Strategy: EMA 20/50 Trend + Fear & Greed + ATR + Volume`);
+  console.log(`  Cadence : every ${CONFIG.cycleMinutes} min`);
   console.log("═══════════════════════════════════════════");
+
+  // Time filter — skip Asian thin-liquidity session unless explicitly disabled.
+  // Live entries: 06:00–24:00 UTC. Exits/breakeven still run continuously
+  // (we never want to skip protective logic on open positions).
+  const utcHour = new Date().getUTCHours();
+  const isAsianThin = CONFIG.skipAsianSession && utcHour >= 0 && utcHour < 6;
+  if (isAsianThin && !CONFIG.paperTrading) {
+    console.log(`\nAsian session (${utcHour}:00 UTC) — running exit/breakeven checks only, skipping new entries`);
+    await checkLiveExits();
+    await tryBreakevenStops();
+    console.log("\n═══════════════════════════════════════════\n");
+    return;
+  }
 
   const [fearGreed] = await Promise.all([fetchFearGreed()]);
   const weeklySentiment = loadWeeklySentiment();
@@ -1006,11 +1136,12 @@ async function run() {
 
 async function loop() {
   acquireLock();
+  const cycleMs = CONFIG.cycleMinutes * 60 * 1000;
   while (true) {
     await run().catch(err => console.error("Bot error:", err.message));
-    const next = new Date(Date.now() + 60 * 60 * 1000);
-    console.log(`Next run: ${next.toISOString()}\n`);
-    await new Promise(r => setTimeout(r, 60 * 60 * 1000));
+    const next = new Date(Date.now() + cycleMs);
+    console.log(`Next run: ${next.toISOString()} (in ${CONFIG.cycleMinutes} min)\n`);
+    await new Promise(r => setTimeout(r, cycleMs));
   }
 }
 
