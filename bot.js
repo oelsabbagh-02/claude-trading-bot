@@ -507,6 +507,7 @@ async function placeLiveOrder(symbol, side, sizeUSD, price, atr, opts = {}) {
 
   const order   = await okxRequest("POST", "/api/v5/trade/order", {
     instId: symbol, tdMode: "cash", side, ordType: "market", sz,
+    tgtCcy: "base_ccy",
   });
   const orderId = order.data[0].ordId;
 
