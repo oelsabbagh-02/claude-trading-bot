@@ -490,7 +490,11 @@ async function okxRequest(method, path, bodyObj = null) {
     ...(body ? { body } : {}),
   });
   const data = await res.json();
-  if (data.code !== "0") throw new Error(`OKX ${method} ${path}: ${data.msg}`);
+  if (data.code !== "0") {
+    const detail = data.data?.[0]?.sMsg ?? data.data?.[0]?.msg ?? "";
+    const code   = data.data?.[0]?.sCode ?? data.code;
+    throw new Error(`OKX ${method} ${path}: ${data.msg || detail || "no message"} (code=${code})`);
+  }
   return data;
 }
 
@@ -516,13 +520,27 @@ async function placeLiveOrder(symbol, side, sizeUSD, price, atr, opts = {}) {
     const algo = await okxRequest("POST", "/api/v5/trade/order-algo", {
       instId: symbol, tdMode: "cash",
       side: isLong ? "sell" : "buy",
-      ordType: "oco", sz,
+      ordType: "oco", sz, tgtCcy: "base_ccy",
       tpTriggerPx: takeProfit.toFixed(4), tpOrdPx: "-1",
       slTriggerPx: stopLoss.toFixed(4),   slOrdPx: "-1",
     });
     algoId = algo.data?.[0]?.algoId ?? null;
   } catch (err) {
-    console.log(`  OCO failed (set stop/target manually on OKX): ${err.message}`);
+    console.log(`  OCO failed: ${err.message}`);
+    // Fallback: stop-only conditional algo. Better than nothing.
+    try {
+      const sl = await okxRequest("POST", "/api/v5/trade/order-algo", {
+        instId: symbol, tdMode: "cash",
+        side: isLong ? "sell" : "buy",
+        ordType: "conditional", sz, tgtCcy: "base_ccy",
+        slTriggerPx: stopLoss.toFixed(4), slOrdPx: "-1",
+      });
+      algoId = sl.data?.[0]?.algoId ?? null;
+      if (algoId) console.log(`  Fallback: stop-only conditional placed (no take-profit)`);
+    } catch (err2) {
+      console.log(`  Fallback stop also failed: ${err2.message}`);
+      console.log(`  ⚠ Position has NO automatic exit — will be reconciled via balance check`);
+    }
   }
 
   return { orderId, algoId, stopLoss, takeProfit };
@@ -551,22 +569,40 @@ async function fetchHoldingUSD(symbol) {
 }
 
 // Check if bot-opened live positions have been closed by their OCO orders
+// or by external/manual action (reconciles tracked positions vs actual balance)
 async function checkLiveExits() {
   const positions = loadJson(LIVE_POSITIONS_FILE, []);
   if (!positions.length) return;
 
   let pending;
   try {
-    const res = await okxRequest("GET", "/api/v5/trade/orders-algo-pending?ordType=oco&limit=100");
+    const [res, balances] = await Promise.all([
+      okxRequest("GET", "/api/v5/trade/orders-algo-pending?ordType=oco,conditional&limit=100"),
+      fetchSpotBalances(),
+    ]);
     pending = new Set((res.data ?? []).map(o => o.algoId));
+    var spotBalances = balances;
   } catch {
     return; // can't check — leave positions as-is
   }
 
   const remaining = [];
   for (const pos of positions) {
-    const stillOpen = !pos.algoId || pending.has(pos.algoId);
-    if (stillOpen) {
+    // Reconciliation: if actual balance is < 10% of expected, position was closed
+    // externally (OCO fired, manual sell, etc.). Mark closed regardless of algoId state.
+    const expectedQty = pos.size / pos.entryPrice;
+    const heldQty     = spotBalances[baseCcy(pos.symbol)]?.qty ?? 0;
+    const isClosed    = heldQty < expectedQty * 0.1;
+    const algoStillOpen = pos.algoId && pending.has(pos.algoId);
+
+    // Still open: bot has algo pending AND balance still holds the asset
+    if (!isClosed && algoStillOpen) {
+      remaining.push(pos);
+      continue;
+    }
+    // Edge case: no algoId attached but balance still there → orphaned; flag and keep
+    if (!isClosed && !pos.algoId) {
+      console.log(`  ⚠ ${pos.symbol} held without algo protection — manual action needed`);
       remaining.push(pos);
       continue;
     }
