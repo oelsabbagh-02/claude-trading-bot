@@ -29,6 +29,10 @@ const CONFIG = {
   timeframe: process.env.TIMEFRAME || "1H",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "50"),
+  // OKX rejects algo (OCO/conditional) orders below ~$10-20 notional, so any
+  // entry below this threshold ships as an orphan position with no stop. Skip
+  // entries that fall below it after tier + conviction multipliers are applied.
+  minTradeSizeUSD: parseFloat(process.env.MIN_TRADE_SIZE_USD || "20"),
   riskPerTrade: parseFloat(process.env.RISK_PER_TRADE || "0.02"),  // fraction of portfolio per trade
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "6", 10),
   paperTrading: process.env.PAPER_TRADING !== "false",
@@ -930,6 +934,14 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
   }
 
   const tradeSize = Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier;
+
+  // Min-size guard: live entries below the algo-order minimum become orphans.
+  // Paper trades are unaffected (no algo orders involved).
+  if (!CONFIG.paperTrading && tradeSize < CONFIG.minTradeSizeUSD) {
+    console.log(`  Skip: $${tradeSize.toFixed(2)} below MIN_TRADE_SIZE_USD ($${CONFIG.minTradeSizeUSD}) — would orphan without stop`);
+    logBlockedTrade({ symbol, reason: `size $${tradeSize.toFixed(2)} below algo minimum`, paperTrading: false });
+    return false;
+  }
 
   const stopOpts = { stopMult: signal.stopMult, targetMult: signal.targetMult };
 
