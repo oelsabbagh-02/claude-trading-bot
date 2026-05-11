@@ -603,6 +603,106 @@ async function fetchHoldingUSD(symbol) {
   return balances[baseCcy(symbol)]?.usdValue ?? 0;
 }
 
+// Active exits: signal-reversal and time-decay liquidation, plus orphan retry.
+// Runs each cycle on every open live position. Closes positions at market when:
+//   1. 1H EMA20 has crossed below EMA50 (trend flipped against a long) — opposite for shorts
+//   2. Position is older than 48h AND not in profit (don't marry the bag)
+//   3. Position is an orphan (algoId null) AND down more than 5% (no OCO will save it)
+// Also tries to (re-)place OCO on orphan positions before deciding to close.
+async function activeExitChecks() {
+  if (CONFIG.paperTrading) return;
+  const positions = loadJson(LIVE_POSITIONS_FILE, []);
+  if (!positions.length) return;
+
+  const remaining = [];
+  let changed    = false;
+
+  for (const pos of positions) {
+    const isLong = pos.side === "buy";
+
+    // Fetch current candles + price for this symbol
+    let candles, price;
+    try {
+      candles = await fetchCandles(pos.symbol, CONFIG.timeframe, 100);
+      price   = candles.at(-1)?.close;
+    } catch {
+      remaining.push(pos);
+      continue;
+    }
+    if (!price) { remaining.push(pos); continue; }
+
+    const closes = candles.map(c => c.close);
+    const ema20  = calcEMA(closes, 20);
+    const ema50  = calcEMA(closes, 50);
+
+    // — Orphan retry: if no algo attached, try OCO once before deciding to close
+    if (!pos.algoId) {
+      const sz = (pos.size / pos.entryPrice).toFixed(8);
+      try {
+        const algo = await okxRequest("POST", "/api/v5/trade/order-algo", {
+          instId: pos.symbol, tdMode: "cash",
+          side: isLong ? "sell" : "buy",
+          ordType: "oco", sz, tgtCcy: "base_ccy",
+          tpTriggerPx: pos.takeProfit.toFixed(4), tpOrdPx: "-1",
+          slTriggerPx: pos.stopLoss.toFixed(4),   slOrdPx: "-1",
+        });
+        const newAlgoId = algo.data?.[0]?.algoId ?? null;
+        if (newAlgoId) {
+          console.log(`  ✓ ${pos.symbol} orphan retroactively protected with OCO`);
+          pos.algoId = newAlgoId;
+          changed = true;
+        }
+      } catch { /* still orphan; carry on to active-exit checks */ }
+    }
+
+    // — Active exit conditions
+    const ageH      = (Date.now() - new Date(pos.openedAt).getTime()) / 3_600_000;
+    const pnlPct    = isLong ? ((price - pos.entryPrice) / pos.entryPrice) : ((pos.entryPrice - price) / pos.entryPrice);
+    const trendDown = (ema20 && ema50) ? ema20 < ema50 : false;
+    const trendUp   = (ema20 && ema50) ? ema20 > ema50 : false;
+
+    let exitReason = null;
+    if (isLong && trendDown) exitReason = `trend reversed (EMA20 < EMA50)`;
+    else if (!isLong && trendUp) exitReason = `trend reversed (EMA20 > EMA50)`;
+    else if (ageH > 48 && pnlPct <= 0) exitReason = `time-decay (${ageH.toFixed(1)}h, ${(pnlPct*100).toFixed(1)}%)`;
+    else if (!pos.algoId && pnlPct <= -0.05) exitReason = `orphan stop-loss (no OCO, ${(pnlPct*100).toFixed(1)}%)`;
+
+    if (!exitReason) {
+      remaining.push(pos);
+      continue;
+    }
+
+    // Cancel any algo first to free the size, then market-sell
+    if (pos.algoId) {
+      try {
+        await okxRequest("POST", "/api/v5/trade/cancel-algos", [{ algoId: pos.algoId, instId: pos.symbol }]);
+      } catch { /* if cancel fails the algo will simply expire when balance is gone */ }
+    }
+
+    // Place market close (sell for long, buy for short — but we're spot-longs-only currently)
+    try {
+      const sz = (pos.size / pos.entryPrice).toFixed(8);
+      await okxRequest("POST", "/api/v5/trade/order", {
+        instId: pos.symbol, tdMode: "cash",
+        side: isLong ? "sell" : "buy", ordType: "market", sz,
+        tgtCcy: "base_ccy",
+      });
+      const holdH = ageH.toFixed(1);
+      const pnlUSD = pnlPct * pos.size;
+      console.log(`  ⚡ ACTIVE EXIT ${pos.symbol} @ $${price.toFixed(6)} | ${exitReason}`);
+      console.log(`       P&L: ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(2)} (${(pnlPct*100).toFixed(2)}%) | Held ${holdH}h`);
+      logClosedTrade(pos, price, pnlUSD, pnlPct * 100, holdH, `Active exit: ${exitReason}`);
+      changed = true;
+      // Don't push to remaining — position closed
+    } catch (err) {
+      console.log(`  Active exit failed for ${pos.symbol}: ${err.message} — keeping in tracker`);
+      remaining.push(pos);
+    }
+  }
+
+  if (changed) saveJson(LIVE_POSITIONS_FILE, remaining);
+}
+
 // After 1.5× ATR favorable move, swap the OCO so stop = entry price.
 // Worst case becomes "free trade" (0% loss); upside via TP is unchanged.
 // Captures the asymmetric "winners run, losers cap at 0" pattern.
@@ -962,9 +1062,11 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
   if (!CONFIG.okx.apiKey) { console.log("  Missing OKX credentials"); return false; }
 
   // Check if any bot-opened positions were closed by their OCO orders;
-  // and try moving stops to breakeven on positions deep in profit.
+  // try moving stops to breakeven on positions deep in profit;
+  // and run active-exit checks (trend reversal, time decay, orphan stop).
   await checkLiveExits();
   await tryBreakevenStops();
+  await activeExitChecks();
 
   // Guard 1: bot already tracking an open position for this symbol
   const livePositions = loadJson(LIVE_POSITIONS_FILE, []);
@@ -1085,6 +1187,7 @@ async function run() {
     console.log(`\nAsian session (${utcHour}:00 UTC) — running exit/breakeven checks only, skipping new entries`);
     await checkLiveExits();
     await tryBreakevenStops();
+    await activeExitChecks();
     console.log("\n═══════════════════════════════════════════\n");
     return;
   }
