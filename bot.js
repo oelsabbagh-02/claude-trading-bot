@@ -1247,7 +1247,11 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
   }
 
   const riskMult  = CONFIG.paperTrading ? 1.0 : (RISK_STATE.positionSizeMult ?? 1.0);
-  const tradeSize = Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier * riskMult;
+  const hardCap   = parseFloat(process.env.HARD_TRADE_CAP_USD || "1e9");
+  const tradeSize = Math.min(
+    Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier * riskMult,
+    hardCap
+  );
 
   // Min-size guard: live entries below the algo-order minimum become orphans.
   // Paper trades are unaffected (no algo orders involved).
