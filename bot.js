@@ -11,15 +11,29 @@ import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } f
 import crypto from "crypto";
 import http from "http";
 
+// ─── Fetch with timeout ───────────────────────────────────────────────────────
+// FETCH_TIMEOUT_MS env var (default 10 000 ms). Prevents a hung OKX/CoinGecko
+// socket from freezing the main loop indefinitely.
+const FETCH_TIMEOUT_MS = parseInt(process.env.FETCH_TIMEOUT_MS || "10000", 10);
+
+function timedFetch(url, opts = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  return fetch(url, { ...opts, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
   // Tier 1 — core large-caps, full risk per trade
+  // Owner authorized trading anything in the portfolio. BTC, ETH, SOL, XRP required.
   symbols: (process.env.SYMBOLS || "BTC-USDC,ETH-USDC,SOL-USDC,XRP-USDC")
     .split(",").map(s => s.trim()).filter(Boolean),
 
   // Tier 2 — portfolio holdings + on-the-radar picks, 75% size
-  radarSymbols: (process.env.RADAR_SYMBOLS || "ADA-USDC,LINK-USDC,ONDO-USDC,FET-USDC,SUI-USDC,NEAR-USDC")
+  // LINK is a portfolio holding (see 06-portfolio-plan.md). All USDC pairs only.
+  radarSymbols: (process.env.RADAR_SYMBOLS || "LINK-USDC,ADA-USDC,ONDO-USDC,FET-USDC,SUI-USDC,NEAR-USDC")
     .split(",").map(s => s.trim()).filter(Boolean),
 
   // Tier 3 — meme coins, 50% size
@@ -27,7 +41,10 @@ const CONFIG = {
     .split(",").map(s => s.trim()).filter(Boolean),
 
   timeframe: process.env.TIMEFRAME || "1H",
-  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
+  // PORTFOLIO_VALUE_USD: static fallback if live balance fetch fails.
+  // In live mode the bot queries OKX at cycle start and overrides this dynamically.
+  // Set this env var as a sensible floor (total equity ~$4617 as of 2026-05-14).
+  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "4617"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "50"),
   // OKX rejects algo (OCO/conditional) orders below ~$10-20 notional, so any
   // entry below this threshold ships as an orphan position with no stop. Skip
@@ -40,8 +57,9 @@ const CONFIG = {
   // "perps" = USDC-margined swaps, longs + shorts with leverage (NOT YET IMPLEMENTED)
   tradeMode: (process.env.TRADE_MODE || "longs").toLowerCase(),
   // Cron cadence in minutes (Railway-mounted process loops itself).
-  // 60 = hourly (legacy). 15 = quarter-hour for tighter exits + faster setup detection.
-  cycleMinutes: parseInt(process.env.CYCLE_MINUTES || "60", 10),
+  // Default: 15 (quarter-hour). Override with CYCLE_MINUTES env var.
+  // Example: CYCLE_MINUTES=60 for hourly. CYCLE_MINUTES=5 for 5-minute.
+  cycleMinutes: parseInt(process.env.CYCLE_MINUTES || "15", 10),
   // Skip Asian-session thin liquidity (00:00–06:00 UTC).
   // Set "false" to disable. Reduces ACE-style top-buying on wide spreads.
   skipAsianSession: process.env.SKIP_ASIAN_SESSION !== "false",
@@ -68,8 +86,132 @@ const LOCK_FILE            = `${DATA_DIR}/bot.lock`;
 const SENTIMENT_FILE       = `${DATA_DIR}/sentiment.json`;
 const TRENDING_FILE        = `${DATA_DIR}/trending-watchlist.json`;
 const WATCHLISTS_FILE      = `${DATA_DIR}/watchlists.json`;
+const PEAK_EQUITY_FILE     = `${DATA_DIR}/peak-equity.json`;
+const RISK_STATE_FILE      = `${DATA_DIR}/risk-state.json`;
 
 const MAX_TRENDING_POSITIONS = parseInt(process.env.MAX_TRENDING_POSITIONS || "2", 10);
+
+// ─── Global position cap (Group B) ────────────────────────────────────────────
+// Max 5 concurrent open positions; max 40% of portfolio deployed at once.
+const MAX_OPEN_POSITIONS   = parseInt(process.env.MAX_OPEN_POSITIONS   || "5",    10);
+const MAX_DEPLOYED_FRAC    = parseFloat(process.env.MAX_DEPLOYED_FRAC  || "0.40");
+
+// ─── Circuit breaker state ────────────────────────────────────────────────────
+// Persisted to RISK_STATE_FILE so restarts don't reset the peak or daily/weekly
+// reference equity — a kill switch that evaporates on redeploy is useless.
+const RISK_STATE = (() => {
+  const saved = (() => {
+    try {
+      if (existsSync(RISK_STATE_FILE)) return JSON.parse(readFileSync(RISK_STATE_FILE, "utf8"));
+    } catch {}
+    return {};
+  })();
+  return {
+    peakEquity:       parseFloat(saved.peakEquity       ?? process.env.PEAK_EQUITY_USD ?? "4617"),
+    dailyStartEquity: saved.dailyStartEquity ? parseFloat(saved.dailyStartEquity) : null,
+    dailyStartDate:   saved.dailyStartDate   ?? null,
+    weeklyStartEquity:saved.weeklyStartEquity ? parseFloat(saved.weeklyStartEquity) : null,
+    weeklyStartDate:  saved.weeklyStartDate  ?? null,
+    consecutiveLosses:parseInt(saved.consecutiveLosses ?? "0", 10),
+    tradingHalted:    saved.tradingHalted    ?? false,
+    newEntriesBlocked:saved.newEntriesBlocked ?? false,
+    positionSizeMult: parseFloat(saved.positionSizeMult ?? "1.0"),
+    pauseUntil:       saved.pauseUntil       ?? null,
+  };
+})();
+
+function persistRiskState() {
+  try { writeFileSync(RISK_STATE_FILE, JSON.stringify(RISK_STATE, null, 2)); } catch {}
+}
+
+// Called at the start of every cycle. Returns true if trading should proceed.
+async function checkCircuitBreakers(currentEquity) {
+  const now     = new Date();
+  const todayStr = now.toISOString().slice(0, 10);
+  const monStr   = (() => {
+    const d = new Date(now);
+    d.setUTCDate(d.getUTCDate() - d.getUTCDay() + 1); // Monday
+    return d.toISOString().slice(0, 10);
+  })();
+
+  // Reset daily reference on new UTC day
+  if (RISK_STATE.dailyStartDate !== todayStr) {
+    RISK_STATE.dailyStartDate   = todayStr;
+    RISK_STATE.dailyStartEquity = currentEquity;
+    RISK_STATE.newEntriesBlocked = false; // reset daily block only; peak/weekly persist
+  }
+  // Reset weekly reference on Monday
+  if (RISK_STATE.weeklyStartDate !== monStr) {
+    RISK_STATE.weeklyStartDate    = monStr;
+    RISK_STATE.weeklyStartEquity  = currentEquity;
+    RISK_STATE.positionSizeMult   = 1.0;
+  }
+
+  // Update peak
+  if (currentEquity > RISK_STATE.peakEquity) {
+    RISK_STATE.peakEquity = currentEquity;
+  }
+
+  const drawdownFromPeak = (RISK_STATE.peakEquity - currentEquity) / RISK_STATE.peakEquity;
+
+  // Kill-switch: -25% from peak
+  if (drawdownFromPeak >= 0.25) {
+    RISK_STATE.tradingHalted = true;
+    console.error(`KILL-SWITCH: equity $${currentEquity.toFixed(0)} is ${(drawdownFromPeak*100).toFixed(1)}% below peak $${RISK_STATE.peakEquity.toFixed(0)}. All trading halted.`);
+    persistRiskState();
+    return false;
+  }
+
+  // Position-pause: -15% from peak
+  if (drawdownFromPeak >= 0.15) {
+    RISK_STATE.newEntriesBlocked = true;
+    console.warn(`POSITION-PAUSE: equity $${currentEquity.toFixed(0)}, drawdown ${(drawdownFromPeak*100).toFixed(1)}% from peak. No new entries.`);
+  }
+
+  // Daily loss limit: -3% from day-open equity
+  if (RISK_STATE.dailyStartEquity) {
+    const dailyLoss = (RISK_STATE.dailyStartEquity - currentEquity) / RISK_STATE.dailyStartEquity;
+    if (dailyLoss >= 0.03) {
+      RISK_STATE.newEntriesBlocked = true;
+      console.warn(`DAILY LOSS LIMIT: -${(dailyLoss*100).toFixed(1)}% today ($${(RISK_STATE.dailyStartEquity - currentEquity).toFixed(0)} lost). Blocking new entries.`);
+    }
+  }
+
+  // Weekly drawdown: -5% from Monday open → halve position sizes
+  if (RISK_STATE.weeklyStartEquity) {
+    const weeklyLoss = (RISK_STATE.weeklyStartEquity - currentEquity) / RISK_STATE.weeklyStartEquity;
+    if (weeklyLoss >= 0.05 && RISK_STATE.positionSizeMult === 1.0) {
+      RISK_STATE.positionSizeMult = 0.5;
+      console.warn(`WEEKLY DRAWDOWN: -${(weeklyLoss*100).toFixed(1)}% this week. Position sizes halved for remainder of week.`);
+    }
+  }
+
+  // Consecutive loss pause (4 in a row → 24h cooldown)
+  if (RISK_STATE.pauseUntil && now < new Date(RISK_STATE.pauseUntil)) {
+    RISK_STATE.newEntriesBlocked = true;
+    console.warn(`CONSECUTIVE LOSS PAUSE until ${RISK_STATE.pauseUntil}. No new entries.`);
+  }
+
+  persistRiskState();
+  return !RISK_STATE.tradingHalted;
+}
+
+// Increment consecutive loss counter; called after each confirmed loss
+function recordTradeLoss() {
+  RISK_STATE.consecutiveLosses++;
+  if (RISK_STATE.consecutiveLosses >= 4) {
+    const until = new Date(Date.now() + 24 * 3_600_000);
+    RISK_STATE.pauseUntil = until.toISOString();
+    RISK_STATE.consecutiveLosses = 0;
+    console.warn(`4 consecutive losses — 24h entry pause until ${RISK_STATE.pauseUntil}`);
+  }
+  persistRiskState();
+}
+
+function recordTradeWin() {
+  RISK_STATE.consecutiveLosses = 0;
+  persistRiskState();
+}
 
 // Extract base currency from OKX symbol e.g. "BTC-USDT" → "BTC"
 function baseCcy(symbol) { return symbol.split("-")[0]; }
@@ -112,7 +254,7 @@ const BAR_MAP = { "1m":"1m","5m":"5m","15m":"15m","30m":"30m","1H":"1H","4H":"4H
 async function fetchCandles(symbol, interval, limit = 200) {
   const bar = BAR_MAP[interval] || "1H";
   const url = `${CONFIG.okx.baseUrl}/api/v5/market/candles?instId=${symbol}&bar=${bar}&limit=${limit}`;
-  const res = await fetch(url);
+  const res = await timedFetch(url);
   if (!res.ok) throw new Error(`OKX market API ${res.status}`);
   const data = await res.json();
   if (data.code !== "0") throw new Error(`OKX: ${data.msg}`);
@@ -162,7 +304,7 @@ function calcATR(candles, period = 14) {
 // Free API — no key needed. Returns 0 (extreme fear) to 100 (extreme greed).
 async function fetchFearGreed() {
   try {
-    const res = await fetch("https://api.alternative.me/fng/?limit=1");
+    const res = await timedFetch("https://api.alternative.me/fng/?limit=1");
     if (!res.ok) return null;
     const data = await res.json();
     const entry = data?.data?.[0];
@@ -176,7 +318,7 @@ async function fetchFearGreed() {
 
 async function fetchTrending() {
   try {
-    const res = await fetch("https://api.coingecko.com/api/v3/search/trending");
+    const res = await timedFetch("https://api.coingecko.com/api/v3/search/trending");
     if (!res.ok) return null;
     const data = await res.json();
     const coins = (data?.coins ?? []).map(c => c.item);
@@ -189,7 +331,7 @@ async function fetchTrending() {
 async function validateOkxPair(symbol) {
   try {
     const url = `${CONFIG.okx.baseUrl}/api/v5/market/ticker?instId=${symbol}`;
-    const res = await fetch(url);
+    const res = await timedFetch(url);
     if (!res.ok) return false;
     const data = await res.json();
     return data.code === "0" && data.data?.length > 0;
@@ -239,7 +381,7 @@ async function fetchCoinGeckoMarkets({ category = null, perPage = 50, page = 1 }
   try {
     const cat = category ? `&category=${category}` : "";
     const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=${page}${cat}`;
-    const res = await fetch(url);
+    const res = await timedFetch(url);
     if (!res.ok) return null;
     return await res.json();
   } catch { return null; }
@@ -302,6 +444,26 @@ function loadWeeklySentiment() {
   return ageMs < 8 * 24 * 3_600_000 ? s : null;
 }
 
+// ─── Chop filter ─────────────────────────────────────────────────────────────
+// Returns true if the market is in chop regime on both 1H and 4H.
+// Chop = EMA(20)/EMA(50) spread < 1.5% on the given timeframe closes.
+// When isChop returns true, new entries are blocked (strategy-pause, not mode-switch).
+const CHOP_EMA_SPREAD_MIN_PCT = parseFloat(process.env.CHOP_EMA_SPREAD_PCT || "1.5");
+
+function emaPctSpread(closes) {
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = calcEMA(closes, 50);
+  if (!ema20 || !ema50 || ema50 === 0) return null;
+  return Math.abs(ema20 - ema50) / ema50 * 100;
+}
+
+function isChopRegime(closes1h, closes4h) {
+  const spread1h = emaPctSpread(closes1h);
+  const spread4h = emaPctSpread(closes4h);
+  if (spread1h === null || spread4h === null) return false; // not enough data — allow entry
+  return spread1h < CHOP_EMA_SPREAD_MIN_PCT && spread4h < CHOP_EMA_SPREAD_MIN_PCT;
+}
+
 // ─── Signal ───────────────────────────────────────────────────────────────────
 
 /**
@@ -324,6 +486,14 @@ function generateSignal(candles, htfCloses, fearGreed, weeklySentiment, mode = "
 
   if (!ema20 || !ema50 || !rsi14 || !htfEma20 || !htfEma50 || !atr) {
     return { side: null, reason: "Not enough candle history yet", sizeMultiplier: 1 };
+  }
+
+  // Chop filter (Group C): block new entries when both 1H and 4H EMA20/50 spread < 1.5%
+  // This is regime classifier in its lightest form — pause only, no mode switch.
+  if (isChopRegime(closes, htfCloses)) {
+    const s1h = emaPctSpread(closes)?.toFixed(2);
+    const s4h = emaPctSpread(htfCloses)?.toFixed(2);
+    return { side: null, reason: `CHOP filter: EMA spread 1H=${s1h}% 4H=${s4h}% both < ${CHOP_EMA_SPREAD_MIN_PCT}% — no entry`, sizeMultiplier: 1 };
   }
 
   // ATR volatility filter — skip dead/choppy markets
@@ -440,7 +610,7 @@ function openPaperPosition(symbol, side, price, atr, size, opts = {}) {
   const takeProfit = isLong ? price + targetMult * atr : price - targetMult * atr;
   const position   = {
     id: `PAPER-${Date.now()}`,
-    symbol, side,
+    symbol, side, mode: "PAPER",
     entryPrice: price, stopLoss, takeProfit,
     size, openedAt: new Date().toISOString(),
   };
@@ -467,10 +637,14 @@ function checkExits(symbol, price, closes) {
       if (isLong  && price >= pos.takeProfit) exitReason = `Take profit $${pos.takeProfit.toFixed(4)}`;
       if (!isLong && price <= pos.takeProfit) exitReason = `Take profit $${pos.takeProfit.toFixed(4)}`;
     }
-    // EMA crossback = early trend reversal exit
+    // EMA crossback = early trend reversal exit.
+    // Require >0.5% spread to avoid whipsaw exits in chop (Group C item 9).
     if (!exitReason && ema20 && ema50) {
-      if (isLong  && ema20 < ema50) exitReason = "EMA20 crossed below EMA50";
-      if (!isLong && ema20 > ema50) exitReason = "EMA20 crossed above EMA50";
+      const crossSpreadPct = Math.abs(ema20 - ema50) / ema50 * 100;
+      if (crossSpreadPct > 0.5) {
+        if (isLong  && ema20 < ema50) exitReason = "EMA20 crossed below EMA50";
+        if (!isLong && ema20 > ema50) exitReason = "EMA20 crossed above EMA50";
+      }
     }
 
     if (exitReason) {
@@ -513,7 +687,7 @@ async function okxRequest(method, path, bodyObj = null) {
   const ts   = new Date().toISOString();
   const body = bodyObj ? JSON.stringify(bodyObj) : "";
   const sign = signOKX(ts, method, path, body);
-  const res  = await fetch(`${CONFIG.okx.baseUrl}${path}`, {
+  const res  = await timedFetch(`${CONFIG.okx.baseUrl}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -579,6 +753,17 @@ async function placeLiveOrder(symbol, side, sizeUSD, price, atr, opts = {}) {
   }
 
   return { orderId, algoId, stopLoss, takeProfit };
+}
+
+// Returns total account equity in USD by summing all asset eqUsd values.
+// Used to set CONFIG.portfolioValue dynamically each cycle.
+async function fetchAccountEquityUSD() {
+  try {
+    const data = await okxRequest("GET", "/api/v5/account/balance");
+    const details = data.data?.[0]?.details ?? [];
+    const total = details.reduce((s, d) => s + parseFloat(d.eqUsd ?? 0), 0);
+    return total > 0 ? total : null;
+  } catch { return null; }
 }
 
 // Returns all spot balances as { CCY: { qty, usdValue } }
@@ -661,9 +846,14 @@ async function activeExitChecks() {
     const trendDown = (ema20 && ema50) ? ema20 < ema50 : false;
     const trendUp   = (ema20 && ema50) ? ema20 > ema50 : false;
 
+    // EMA crossback exit requires >0.5% spread to avoid whipsaw exits in chop (Group C item 9).
+    const emaCrossSpreadPct = (ema20 && ema50) ? Math.abs(ema20 - ema50) / ema50 * 100 : 0;
+    const committedTrendDown = trendDown && emaCrossSpreadPct > 0.5;
+    const committedTrendUp   = trendUp   && emaCrossSpreadPct > 0.5;
+
     let exitReason = null;
-    if (isLong && trendDown) exitReason = `trend reversed (EMA20 < EMA50)`;
-    else if (!isLong && trendUp) exitReason = `trend reversed (EMA20 > EMA50)`;
+    if (isLong && committedTrendDown) exitReason = `trend reversed (EMA20 < EMA50, spread ${emaCrossSpreadPct.toFixed(2)}%)`;
+    else if (!isLong && committedTrendUp) exitReason = `trend reversed (EMA20 > EMA50, spread ${emaCrossSpreadPct.toFixed(2)}%)`;
     else if (ageH > 48 && pnlPct <= 0) exitReason = `time-decay (${ageH.toFixed(1)}h, ${(pnlPct*100).toFixed(1)}%)`;
     else if (!pos.algoId && pnlPct <= -0.05) exitReason = `orphan stop-loss (no OCO, ${(pnlPct*100).toFixed(1)}%)`;
 
@@ -738,15 +928,7 @@ async function tryBreakevenStops() {
       continue;
     }
 
-    // Cancel old OCO, place new one with stop at entry. Risk: brief unprotected window.
-    try {
-      await okxRequest("POST", "/api/v5/trade/cancel-algos", [{ algoId: pos.algoId, instId: pos.symbol }]);
-    } catch (err) {
-      console.log(`  Breakeven cancel failed for ${pos.symbol}: ${err.message}`);
-      updated.push(pos);
-      continue;
-    }
-
+    // Place NEW OCO first, then cancel old one — eliminates the naked-position race window.
     const sz = (pos.size / pos.entryPrice).toFixed(8);
     let newAlgoId = null;
     try {
@@ -773,12 +955,21 @@ async function tryBreakevenStops() {
       }
     }
 
-    if (newAlgoId) {
-      console.log(`  ✓ ${pos.symbol} stop moved to breakeven @ $${pos.entryPrice.toFixed(4)} (price $${price.toFixed(6)}, +${move.toFixed(6)})`);
-      updated.push({ ...pos, algoId: newAlgoId, stopLoss: pos.entryPrice, breakevenSet: true });
+    if (!newAlgoId) {
+      // New order failed — do NOT cancel old OCO. Position stays protected at original stop.
+      console.log(`  Breakeven skipped for ${pos.symbol} — new OCO failed; keeping original protection.`);
+      updated.push(pos);
+      changed = false; // undo changed flag for this pos since we kept it
+      // still mark changed true below to persist state for other positions
     } else {
-      console.log(`  ⚠ ${pos.symbol} unprotected — original OCO cancelled, replacement failed; reconcile will catch`);
-      updated.push({ ...pos, algoId: null });
+      // New OCO confirmed. Now safe to cancel the old one.
+      try {
+        await okxRequest("POST", "/api/v5/trade/cancel-algos", [{ algoId: pos.algoId, instId: pos.symbol }]);
+      } catch (err) {
+        console.log(`  Old OCO cancel failed for ${pos.symbol}: ${err.message} — two OCOs briefly active; OKX will reject the first to fill`);
+      }
+      console.log(`  ${pos.symbol} stop moved to breakeven @ $${pos.entryPrice.toFixed(4)} (price $${price.toFixed(6)}, +${move.toFixed(6)})`);
+      updated.push({ ...pos, algoId: newAlgoId, stopLoss: pos.entryPrice, breakevenSet: true });
     }
     changed = true;
   }
@@ -793,13 +984,14 @@ async function checkLiveExits() {
   if (!positions.length) return;
 
   let pending;
+  let spotBalances = {};
   try {
     const [res, balances] = await Promise.all([
       okxRequest("GET", "/api/v5/trade/orders-algo-pending?ordType=oco,conditional&limit=100"),
       fetchSpotBalances(),
     ]);
     pending = new Set((res.data ?? []).map(o => o.algoId));
-    var spotBalances = balances;
+    spotBalances = balances;
   } catch {
     return; // can't check — leave positions as-is
   }
@@ -891,12 +1083,14 @@ function logClosedTrade(pos, exitPrice, pnlUSD, pnlPct, holdH, exitReason) {
   const now  = new Date();
   const sign = pnlUSD >= 0 ? "+" : "";
   const fee  = (pos.size * 0.001).toFixed(4);
+  // Use mode stored on position record (set at open time), fallback to current config
+  const mode = pos.mode ?? (CONFIG.paperTrading ? "PAPER" : "LIVE");
   csvRow([
     now.toISOString().slice(0, 10), now.toISOString().slice(11, 19),
     "OKX", pos.symbol, pos.side.toUpperCase(), (pos.size / pos.entryPrice).toFixed(8),
     pos.entryPrice.toFixed(4), exitPrice.toFixed(4), pos.size.toFixed(2), fee,
     `${sign}${pnlUSD.toFixed(2)}`, `${sign}${pnlPct.toFixed(2)}%`,
-    holdH, pos.id, "PAPER", `"${exitReason}"`,
+    holdH, pos.id, mode, `"${exitReason}"`,
   ]);
 }
 
@@ -1005,7 +1199,7 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
   const pd = price >= 100 ? 2 : price >= 1 ? 4 : 6;
   console.log(`  Price $${price.toFixed(pd)} | RSI(14) ${rsi14?.toFixed(1)} | EMA20 ${ema20?.toFixed(pd)} / EMA50 ${ema50?.toFixed(pd)} | ATR $${atr?.toFixed(pd)}`);
 
-  // Check & close any existing paper positions for this symbol
+  // Check & close any existing paper positions for this symbol (paper only)
   if (CONFIG.paperTrading) checkExits(symbol, price, closes);
 
   if (todayCount >= CONFIG.maxTradesPerDay) {
@@ -1013,9 +1207,28 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
     return false;
   }
 
-  // One position per symbol max
+  // One position per symbol max (paper)
   const positions = loadJson(POSITIONS_FILE, []);
   if (positions.some(p => p.symbol === symbol)) return false;
+
+  // Global position cap (live): max 5 concurrent, max 40% deployed (Group B)
+  if (!CONFIG.paperTrading) {
+    const livePosAll = loadJson(LIVE_POSITIONS_FILE, []);
+    if (livePosAll.length >= MAX_OPEN_POSITIONS) {
+      console.log(`  Global position cap (${MAX_OPEN_POSITIONS}) reached — skipping`);
+      return false;
+    }
+    const deployed = livePosAll.reduce((s, p) => s + (p.size ?? 0), 0);
+    if (deployed > CONFIG.portfolioValue * MAX_DEPLOYED_FRAC) {
+      console.log(`  Deployed capital cap (${(MAX_DEPLOYED_FRAC*100).toFixed(0)}%) reached ($${deployed.toFixed(0)}/$${(CONFIG.portfolioValue * MAX_DEPLOYED_FRAC).toFixed(0)}) — skipping`);
+      return false;
+    }
+    // Circuit breaker gate: block new entries if flag is set
+    if (RISK_STATE.newEntriesBlocked) {
+      console.log(`  New entries blocked by circuit breaker — skipping`);
+      return false;
+    }
+  }
 
   const signal = generateSignal(candles, htfCloses, fearGreed, weeklySentiment, mode);
   console.log(`  Signal: ${signal.side ? signal.side.toUpperCase() : "NONE"} — ${signal.reason}`);
@@ -1033,7 +1246,8 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
     return false;
   }
 
-  const tradeSize = Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier;
+  const riskMult  = CONFIG.paperTrading ? 1.0 : (RISK_STATE.positionSizeMult ?? 1.0);
+  const tradeSize = Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier * riskMult;
 
   // Min-size guard: live entries below the algo-order minimum become orphans.
   // Paper trades are unaffected (no algo orders involved).
@@ -1061,14 +1275,8 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
 
   if (!CONFIG.okx.apiKey) { console.log("  Missing OKX credentials"); return false; }
 
-  // Check if any bot-opened positions were closed by their OCO orders;
-  // try moving stops to breakeven on positions deep in profit;
-  // and run active-exit checks (trend reversal, time decay, orphan stop).
-  await checkLiveExits();
-  await tryBreakevenStops();
-  await activeExitChecks();
-
   // Guard 1: bot already tracking an open position for this symbol
+  // (Exit checks are hoisted to run() — executed once per cycle, not per-symbol)
   const livePositions = loadJson(LIVE_POSITIONS_FILE, []);
   if (livePositions.some(p => p.symbol === symbol)) {
     console.log(`  Bot already has a live position in ${symbol} — skipping`);
@@ -1090,7 +1298,7 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
 
     // Track so we can detect OCO fills on future runs
     const newPos = {
-      id: orderId, symbol, side: "buy",
+      id: orderId, symbol, side: "buy", mode: "LIVE",
       entryPrice: price, stopLoss, takeProfit,
       size: tradeSize, algoId: algoId ?? null,
       openedAt: new Date().toISOString(),
@@ -1178,16 +1386,41 @@ async function run() {
   console.log(`  Cadence : every ${CONFIG.cycleMinutes} min`);
   console.log("═══════════════════════════════════════════");
 
+  // Dynamic portfolio value — query actual account balance each cycle.
+  // Falls back to env var PORTFOLIO_VALUE_USD, then to in-memory default ($4617).
+  if (!CONFIG.paperTrading && CONFIG.okx.apiKey) {
+    const equity = await fetchAccountEquityUSD();
+    if (equity && equity > 0) {
+      CONFIG.portfolioValue = equity;
+      console.log(`Portfolio value (live): $${equity.toFixed(2)}`);
+
+      // Circuit breaker check — may block entries or halt trading entirely
+      const canTrade = await checkCircuitBreakers(equity);
+      if (!canTrade) {
+        console.log("\nTrading halted by circuit breaker. Exiting cycle.\n");
+        return;
+      }
+    }
+  } else if (process.env.PORTFOLIO_VALUE_USD) {
+    CONFIG.portfolioValue = parseFloat(process.env.PORTFOLIO_VALUE_USD);
+  }
+  console.log(`Sizing against: $${CONFIG.portfolioValue.toFixed(0)} portfolio`);
+
+  // Hoist exit checks: run once per cycle before any symbol analysis,
+  // not once per symbol (fixes H1 audit finding — redundant API calls + race condition).
+  if (!CONFIG.paperTrading) {
+    await checkLiveExits();
+    await tryBreakevenStops();
+    await activeExitChecks();
+  }
+
   // Time filter — skip Asian thin-liquidity session unless explicitly disabled.
   // Live entries: 06:00–24:00 UTC. Exits/breakeven still run continuously
   // (we never want to skip protective logic on open positions).
   const utcHour = new Date().getUTCHours();
   const isAsianThin = CONFIG.skipAsianSession && utcHour >= 0 && utcHour < 6;
   if (isAsianThin && !CONFIG.paperTrading) {
-    console.log(`\nAsian session (${utcHour}:00 UTC) — running exit/breakeven checks only, skipping new entries`);
-    await checkLiveExits();
-    await tryBreakevenStops();
-    await activeExitChecks();
+    console.log(`\nAsian session (${utcHour}:00 UTC) — exit/breakeven checks done, skipping new entries`);
     console.log("\n═══════════════════════════════════════════\n");
     return;
   }
@@ -1216,8 +1449,10 @@ async function run() {
     }
 
     // Tier 4: cap at MAX_TRENDING_POSITIONS open at once
+    // Use correct positions file depending on live vs paper mode (fixes audit M2)
     if (tier.label.includes("TIER 4")) {
-      const openTrending = loadJson(POSITIONS_FILE, [])
+      const trendingPosFile = CONFIG.paperTrading ? POSITIONS_FILE : LIVE_POSITIONS_FILE;
+      const openTrending = loadJson(trendingPosFile, [])
         .filter(p => trendingCoins.some(c => c.symbol === p.symbol)).length;
       if (openTrending >= MAX_TRENDING_POSITIONS) {
         console.log(`\n${tier.label}`);
@@ -1231,9 +1466,10 @@ async function run() {
       todayCount = countTodaysTrades();
       if (todayCount >= CONFIG.maxTradesPerDay) break;
 
-      // Re-check trending cap per symbol
+      // Re-check trending cap per symbol (live vs paper fix, audit M2)
       if (tier.label.includes("TIER 4")) {
-        const openTrending = loadJson(POSITIONS_FILE, [])
+        const trendingPosFile = CONFIG.paperTrading ? POSITIONS_FILE : LIVE_POSITIONS_FILE;
+        const openTrending = loadJson(trendingPosFile, [])
           .filter(p => trendingCoins.some(c => c.symbol === p.symbol)).length;
         if (openTrending >= MAX_TRENDING_POSITIONS) break;
         console.log(`  [TRENDING] ${trendingCoins.find(c => c.symbol === symbol)?.name} — CoinGecko rank #${trendingCoins.find(c => c.symbol === symbol)?.geckoRank}`);
