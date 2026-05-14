@@ -93,8 +93,8 @@ const MAX_TRENDING_POSITIONS = parseInt(process.env.MAX_TRENDING_POSITIONS || "2
 
 // ─── Global position cap (Group B) ────────────────────────────────────────────
 // Max 5 concurrent open positions; max 40% of portfolio deployed at once.
-const MAX_OPEN_POSITIONS   = parseInt(process.env.MAX_OPEN_POSITIONS   || "5",    10);
-const MAX_DEPLOYED_FRAC    = parseFloat(process.env.MAX_DEPLOYED_FRAC  || "0.40");
+const MAX_OPEN_POSITIONS   = parseInt(process.env.MAX_OPEN_POSITIONS   || "12",   10);
+const MAX_DEPLOYED_FRAC    = parseFloat(process.env.MAX_DEPLOYED_FRAC  || "0.60");
 
 // ─── Circuit breaker state ────────────────────────────────────────────────────
 // Persisted to RISK_STATE_FILE so restarts don't reset the peak or daily/weekly
