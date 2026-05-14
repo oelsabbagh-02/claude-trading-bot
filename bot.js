@@ -729,7 +729,7 @@ async function placeLiveOrder(symbol, side, sizeUSD, price, atr, opts = {}) {
     const algo = await okxRequest("POST", "/api/v5/trade/order-algo", {
       instId: symbol, tdMode: "cash",
       side: isLong ? "sell" : "buy",
-      ordType: "oco", sz, tgtCcy: "base_ccy",
+      ordType: "oco", sz,
       tpTriggerPx: takeProfit.toFixed(4), tpOrdPx: "-1",
       slTriggerPx: stopLoss.toFixed(4),   slOrdPx: "-1",
     });
@@ -741,7 +741,7 @@ async function placeLiveOrder(symbol, side, sizeUSD, price, atr, opts = {}) {
       const sl = await okxRequest("POST", "/api/v5/trade/order-algo", {
         instId: symbol, tdMode: "cash",
         side: isLong ? "sell" : "buy",
-        ordType: "conditional", sz, tgtCcy: "base_ccy",
+        ordType: "conditional", sz,
         slTriggerPx: stopLoss.toFixed(4), slOrdPx: "-1",
       });
       algoId = sl.data?.[0]?.algoId ?? null;
@@ -827,7 +827,7 @@ async function activeExitChecks() {
         const algo = await okxRequest("POST", "/api/v5/trade/order-algo", {
           instId: pos.symbol, tdMode: "cash",
           side: isLong ? "sell" : "buy",
-          ordType: "oco", sz, tgtCcy: "base_ccy",
+          ordType: "oco", sz,
           tpTriggerPx: pos.takeProfit.toFixed(4), tpOrdPx: "-1",
           slTriggerPx: pos.stopLoss.toFixed(4),   slOrdPx: "-1",
         });
@@ -935,7 +935,7 @@ async function tryBreakevenStops() {
       const algo = await okxRequest("POST", "/api/v5/trade/order-algo", {
         instId: pos.symbol, tdMode: "cash",
         side: isLong ? "sell" : "buy",
-        ordType: "oco", sz, tgtCcy: "base_ccy",
+        ordType: "oco", sz,
         tpTriggerPx: pos.takeProfit.toFixed(4), tpOrdPx: "-1",
         slTriggerPx: pos.entryPrice.toFixed(4),  slOrdPx: "-1",
       });
@@ -946,7 +946,7 @@ async function tryBreakevenStops() {
         const sl = await okxRequest("POST", "/api/v5/trade/order-algo", {
           instId: pos.symbol, tdMode: "cash",
           side: isLong ? "sell" : "buy",
-          ordType: "conditional", sz, tgtCcy: "base_ccy",
+          ordType: "conditional", sz,
           slTriggerPx: pos.entryPrice.toFixed(4), slOrdPx: "-1",
         });
         newAlgoId = sl.data?.[0]?.algoId ?? null;
