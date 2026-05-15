@@ -96,6 +96,20 @@ const MAX_TRENDING_POSITIONS = parseInt(process.env.MAX_TRENDING_POSITIONS || "2
 const MAX_OPEN_POSITIONS   = parseInt(process.env.MAX_OPEN_POSITIONS   || "12",   10);
 const MAX_DEPLOYED_FRAC    = parseFloat(process.env.MAX_DEPLOYED_FRAC  || "0.60");
 
+// ─── Mean reversion module ────────────────────────────────────────────────────
+// Fires when trend module is blocked by chop filter AND symbol has a "mean" to
+// revert to (i.e. fundamentally healthy asset, not a meme). Catches oversold
+// bounces that trend-followers structurally miss.
+const MEAN_REV_UNIVERSE = new Set([
+  "BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC", "BNB-USDC",
+  "LINK-USDC", "ADA-USDC", "DOGE-USDC", "HYPE-USDC",
+]);
+const MEAN_REV_RSI_MAX        = parseFloat(process.env.MEAN_REV_RSI_MAX        || "28");
+const MEAN_REV_NEAR_LOW_PCT   = parseFloat(process.env.MEAN_REV_NEAR_LOW_PCT   || "0.03"); // within 3% of HTF low
+const MEAN_REV_VOL_MULT       = parseFloat(process.env.MEAN_REV_VOL_MULT       || "1.5");
+const MEAN_REV_FG_MAX         = parseFloat(process.env.MEAN_REV_FG_MAX         || "50");
+const MEAN_REV_MAX_POSITIONS  = parseInt(process.env.MEAN_REV_MAX_POSITIONS    || "2",   10);
+
 // ─── Circuit breaker state ────────────────────────────────────────────────────
 // Persisted to RISK_STATE_FILE so restarts don't reset the peak or daily/weekly
 // reference equity — a kill switch that evaporates on redeploy is useless.
@@ -475,7 +489,54 @@ function isChopRegime(closes1h, closes4h) {
  * Short entry: 1H EMA20 < EMA50 AND RSI 30-62 AND F&G > 15
  *   (paper only — spot accounts cannot short)
  */
-function generateSignal(candles, htfCloses, fearGreed, weeklySentiment, mode = "trend") {
+// Mean reversion signal — fires when symbol is deeply oversold near recent low.
+// Uses 4H (htfCandles) as the reversion timeframe; 1H is too noisy for this.
+// Returns a signal object or null if conditions not met.
+function tryMeanRevSignal(symbol, htfCandles, fearGreed) {
+  if (!MEAN_REV_UNIVERSE.has(symbol)) return null;
+  if (!htfCandles || htfCandles.length < 50) return null;
+
+  const htfCloses = htfCandles.map(c => c.close);
+  const htfRsi    = calcRSI(htfCloses, 14);
+  const htfAtr    = calcATR(htfCandles, 14);
+  if (!htfRsi || !htfAtr) return null;
+
+  const price = htfCloses.at(-1);
+
+  // 1. Deep oversold on 4H
+  if (htfRsi > MEAN_REV_RSI_MAX) {
+    return { side: null, reason: `mean-rev: RSI 4H ${htfRsi.toFixed(1)} > ${MEAN_REV_RSI_MAX}` };
+  }
+  // 2. Within X% of 50-bar low (≈8 days of 4H data)
+  const recentLow = Math.min(...htfCloses.slice(-50));
+  const pctFromLow = (price - recentLow) / recentLow;
+  if (pctFromLow > MEAN_REV_NEAR_LOW_PCT) {
+    return { side: null, reason: `mean-rev: ${(pctFromLow*100).toFixed(2)}% above 50-bar low, need ≤${(MEAN_REV_NEAR_LOW_PCT*100).toFixed(0)}%` };
+  }
+  // 3. Capitulation volume on most recent CLOSED 4H bar
+  const closedVol = htfCandles.at(-2)?.volume ?? 0;
+  const avgVol = htfCandles.slice(-22, -2).reduce((s, c) => s + c.volume, 0) / 20;
+  if (avgVol > 0 && closedVol < avgVol * MEAN_REV_VOL_MULT) {
+    return { side: null, reason: `mean-rev: volume ${closedVol.toFixed(0)} < ${MEAN_REV_VOL_MULT}× avg ${avgVol.toFixed(0)}` };
+  }
+  // 4. Fear & Greed not euphoric
+  const fg = fearGreed?.value ?? 50;
+  if (fg > MEAN_REV_FG_MAX) {
+    return { side: null, reason: `mean-rev: F&G ${fg} > ${MEAN_REV_FG_MAX}` };
+  }
+
+  return {
+    side: "buy",
+    reason: `MEAN-REV — RSI 4H ${htfRsi.toFixed(1)} ≤ ${MEAN_REV_RSI_MAX} | ${(pctFromLow*100).toFixed(2)}% from low | vol ${(closedVol/avgVol).toFixed(2)}× | F&G ${fg}`,
+    sizeMultiplier: 0.7,
+    stopMult: 1.5,
+    targetMult: 3.0,
+    entryMode: "mean-rev",
+  };
+}
+
+function generateSignal(candles, htfCandles, fearGreed, weeklySentiment, mode = "trend", symbol = null) {
+  const htfCloses = htfCandles.map(c => c.close);
   const closes   = candles.map(c => c.close);
   const ema20    = calcEMA(closes, 20);
   const ema50    = calcEMA(closes, 50);
@@ -489,10 +550,16 @@ function generateSignal(candles, htfCloses, fearGreed, weeklySentiment, mode = "
   }
 
   // Chop filter (Group C): block new entries when both 1H and 4H EMA20/50 spread < 1.5%
-  // This is regime classifier in its lightest form — pause only, no mode switch.
+  // BUT: before returning, try mean reversion. Mean rev fires in oversold chop —
+  // exactly the regime where trend strategies fail. Complementary, never overlap.
   if (isChopRegime(closes, htfCloses)) {
     const s1h = emaPctSpread(closes)?.toFixed(2);
     const s4h = emaPctSpread(htfCloses)?.toFixed(2);
+    if (mode === "trend" && symbol) {
+      const mr = tryMeanRevSignal(symbol, htfCandles, fearGreed);
+      if (mr?.side === "buy") return mr;
+      // mr exists but null side = mean rev evaluated, didn't qualify → fall through to chop block reason
+    }
     return { side: null, reason: `CHOP filter: EMA spread 1H=${s1h}% 4H=${s4h}% both < ${CHOP_EMA_SPREAD_MIN_PCT}% — no entry`, sizeMultiplier: 1 };
   }
 
@@ -1230,8 +1297,18 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
     }
   }
 
-  const signal = generateSignal(candles, htfCloses, fearGreed, weeklySentiment, mode);
+  const signal = generateSignal(candles, htfCandles, fearGreed, weeklySentiment, mode, symbol);
   console.log(`  Signal: ${signal.side ? signal.side.toUpperCase() : "NONE"} — ${signal.reason}`);
+
+  // Mean-rev cap: don't compound on falling knives — max 2 mean-rev positions concurrent
+  if (signal.entryMode === "mean-rev" && !CONFIG.paperTrading) {
+    const meanRevOpen = loadJson(LIVE_POSITIONS_FILE, []).filter(p => p.entryMode === "mean-rev").length;
+    if (meanRevOpen >= MEAN_REV_MAX_POSITIONS) {
+      console.log(`  Mean-rev cap (${MEAN_REV_MAX_POSITIONS}) reached — skipping`);
+      logBlockedTrade({ symbol, reason: `mean-rev cap reached`, paperTrading: false });
+      return false;
+    }
+  }
 
   if (!signal.side) {
     logBlockedTrade({ symbol, reason: signal.reason, paperTrading: CONFIG.paperTrading });
@@ -1306,6 +1383,7 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
       entryPrice: price, stopLoss, takeProfit,
       size: tradeSize, algoId: algoId ?? null,
       openedAt: new Date().toISOString(),
+      entryMode: signal.entryMode ?? "trend",
     };
     const all = loadJson(LIVE_POSITIONS_FILE, []);
     all.push(newPos);
