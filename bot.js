@@ -88,6 +88,7 @@ const TRENDING_FILE        = `${DATA_DIR}/trending-watchlist.json`;
 const WATCHLISTS_FILE      = `${DATA_DIR}/watchlists.json`;
 const PEAK_EQUITY_FILE     = `${DATA_DIR}/peak-equity.json`;
 const RISK_STATE_FILE      = `${DATA_DIR}/risk-state.json`;
+const INTEL_FILE           = `${DATA_DIR}/daily-intel.json`;
 
 const MAX_TRENDING_POSITIONS = parseInt(process.env.MAX_TRENDING_POSITIONS || "2", 10);
 
@@ -109,6 +110,15 @@ const MEAN_REV_NEAR_LOW_PCT   = parseFloat(process.env.MEAN_REV_NEAR_LOW_PCT   |
 const MEAN_REV_VOL_MULT       = parseFloat(process.env.MEAN_REV_VOL_MULT       || "1.5");
 const MEAN_REV_FG_MAX         = parseFloat(process.env.MEAN_REV_FG_MAX         || "50");
 const MEAN_REV_MAX_POSITIONS  = parseInt(process.env.MEAN_REV_MAX_POSITIONS    || "2",   10);
+
+// ─── Daily intel (DRY-RUN) ────────────────────────────────────────────────────
+// Macro layer that biases bot behavior. Currently DRY-RUN ONLY — bot logs what
+// intel WOULD have done each cycle but doesn't act on it. After we collect a
+// week of counterfactual data we decide if it gets wired live.
+// Architectural rule: intel is DEFENSIVE only — can pause/reduce/tighten,
+// never push/enlarge/loosen. Never overrides circuit breakers or safety caps.
+const INTEL_DRY_RUN          = (process.env.INTEL_DRY_RUN ?? "true").toLowerCase() !== "false";
+const INTEL_REFRESH_HOURS    = parseFloat(process.env.INTEL_REFRESH_HOURS || "12");
 
 // ─── Circuit breaker state ────────────────────────────────────────────────────
 // Persisted to RISK_STATE_FILE so restarts don't reset the peak or daily/weekly
@@ -533,6 +543,102 @@ function tryMeanRevSignal(symbol, htfCandles, fearGreed) {
     targetMult: 3.0,
     entryMode: "mean-rev",
   };
+}
+
+// Daily intel — computes macro bias + caution flags from data signals.
+// Pure rules-based for v1 (no LLM dependency). Cached to disk; refreshed every
+// INTEL_REFRESH_HOURS so we don't hammer endpoints each 15-min cycle.
+async function computeDailyIntel(fearGreed) {
+  const fg = fearGreed?.value ?? 50;
+
+  // BTC funding rate — sentiment-of-the-leveraged-tape
+  let btcFunding = null;
+  try {
+    const res = await okxRequest("GET", "/api/v5/public/funding-rate?instId=BTC-USDT-SWAP");
+    btcFunding = parseFloat(res.data?.[0]?.fundingRate ?? "0");
+  } catch { /* funding unavailable, fall through */ }
+
+  // BTC 24h move
+  let btcMove24h = 0;
+  try {
+    const t = await okxRequest("GET", "/api/v5/market/ticker?instId=BTC-USDC");
+    const last = parseFloat(t.data?.[0]?.last ?? "0");
+    const open = parseFloat(t.data?.[0]?.open24h ?? last);
+    btcMove24h = open > 0 ? (last - open) / open : 0;
+  } catch { /* */ }
+
+  // ── Synthesize bias ──────────────────────────────────────────────────────
+  const cautionFlags = [];
+  let bearishScore = 0;
+  let bullishScore = 0;
+
+  // F&G extremes
+  if (fg <= 25)              { bullishScore++; cautionFlags.push(`F&G ${fg} extreme fear — contrarian bullish`); }
+  else if (fg <= 40)         { bullishScore += 0.5; }
+  else if (fg >= 75)         { bearishScore++; cautionFlags.push(`F&G ${fg} greed — top-zone caution`); }
+
+  // Funding rate signal — negative funding = shorts paying = capitulation
+  if (btcFunding !== null) {
+    if (btcFunding < -0.0001)   { bullishScore += 0.5; cautionFlags.push(`BTC funding ${(btcFunding*100).toFixed(4)}% — shorts paying, capitulation tilt`); }
+    else if (btcFunding > 0.0005) { bearishScore += 0.5; cautionFlags.push(`BTC funding ${(btcFunding*100).toFixed(4)}% — overheated longs`); }
+  }
+
+  // BTC 24h drop signal — sharp drops are bearish in short-term momentum
+  if (btcMove24h < -0.04)     { bearishScore++; cautionFlags.push(`BTC -${(Math.abs(btcMove24h)*100).toFixed(2)}% 24h — sharp drop`); }
+  else if (btcMove24h > 0.04) { bullishScore += 0.5; }
+
+  // Net bias — explicit symmetric scoring
+  let macroBias = "neutral";
+  if (bearishScore - bullishScore >= 1)      macroBias = "bearish";
+  else if (bullishScore - bearishScore >= 1) macroBias = "bullish";
+
+  // Sizing — defensive only. Bearish reduces, bullish does NOT amplify.
+  const sizingMultiplier = macroBias === "bearish" ? 0.5 : 1.0;
+  const rsiBarRaisedTo   = macroBias === "bearish" ? Math.min(MEAN_REV_RSI_MAX - 3, 25) : MEAN_REV_RSI_MAX;
+  const pauseNewEntries  = bearishScore >= 2;
+
+  return {
+    asOf: new Date().toISOString(),
+    inputs: { fg, btcFunding, btcMove24h },
+    scores: { bullish: bullishScore, bearish: bearishScore },
+    macroBias,
+    biasReason: cautionFlags.length ? cautionFlags.join("; ") : "no notable signals",
+    sizingMultiplier,
+    rsiBarRaisedTo,
+    pauseNewEntries,
+    cautionFlags,
+  };
+}
+
+// Load intel from disk; refresh if stale (>INTEL_REFRESH_HOURS old).
+async function ensureDailyIntel(fearGreed) {
+  const cached = loadJson(INTEL_FILE, null);
+  if (cached) {
+    const ageH = (Date.now() - new Date(cached.asOf).getTime()) / 3_600_000;
+    if (ageH < INTEL_REFRESH_HOURS) return cached;
+  }
+  try {
+    const fresh = await computeDailyIntel(fearGreed);
+    saveJson(INTEL_FILE, fresh);
+    return fresh;
+  } catch (err) {
+    console.log(`  Intel compute failed: ${err.message} — using cached or neutral`);
+    return cached ?? { macroBias: "neutral", sizingMultiplier: 1.0, pauseNewEntries: false, cautionFlags: [], rsiBarRaisedTo: MEAN_REV_RSI_MAX, biasReason: "intel unavailable" };
+  }
+}
+
+// DRY-RUN check — log what intel WOULD have done, never act on it.
+function intelDryRunCheck(signal, intel, tradeSize) {
+  if (!INTEL_DRY_RUN || !intel) return;
+  const wouldChange = [];
+  if (intel.pauseNewEntries && signal.side)         wouldChange.push(`PAUSE entry (${intel.biasReason})`);
+  if (intel.sizingMultiplier < 1.0 && signal.side)  wouldChange.push(`SIZE ${(intel.sizingMultiplier*100).toFixed(0)}% → $${(tradeSize*intel.sizingMultiplier).toFixed(2)} (was $${tradeSize.toFixed(2)})`);
+  if (signal.entryMode === "mean-rev" && intel.rsiBarRaisedTo < MEAN_REV_RSI_MAX) wouldChange.push(`mean-rev RSI bar raised to ${intel.rsiBarRaisedTo}`);
+  if (wouldChange.length) {
+    console.log(`  [INTEL DRY-RUN] would: ${wouldChange.join(" | ")}`);
+  } else if (signal.side && intel.cautionFlags.length) {
+    console.log(`  [INTEL DRY-RUN] no override — flags noted: ${intel.cautionFlags.join("; ")}`);
+  }
 }
 
 function generateSignal(candles, htfCandles, fearGreed, weeklySentiment, mode = "trend", symbol = null) {
@@ -1240,7 +1346,7 @@ function countTodaysTrades() {
 
 // ─── Analyse one symbol ───────────────────────────────────────────────────────
 
-async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tierMultiplier = 1.0, mode = "trend") {
+async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tierMultiplier = 1.0, mode = "trend", intel = null) {
   // Hard guard — bot will never trade non-USDC pairs
   if (!symbol.endsWith("-USDC")) {
     console.log(`\n  Skipping ${symbol} — only USDC pairs allowed`);
@@ -1329,6 +1435,9 @@ async function analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tie
     Math.min(CONFIG.portfolioValue * CONFIG.riskPerTrade, CONFIG.maxTradeSizeUSD) * (signal.sizeMultiplier ?? 1) * tierMultiplier * riskMult,
     hardCap
   );
+
+  // DRY-RUN: log what daily intel WOULD have changed — do not act on it (yet)
+  intelDryRunCheck(signal, intel, tradeSize);
 
   // Min-size guard: live entries below the algo-order minimum become orphans.
   // Paper trades are unaffected (no algo orders involved).
@@ -1509,9 +1618,11 @@ async function run() {
 
   const [fearGreed] = await Promise.all([fetchFearGreed()]);
   const weeklySentiment = loadWeeklySentiment();
+  const intel = await ensureDailyIntel(fearGreed);
 
   if (fearGreed) console.log(`\nFear & Greed Index: ${fearGreed.value}/100 (${fearGreed.label})`);
   if (weeklySentiment) console.log(`Weekly sentiment  : ${weeklySentiment.bias} (score ${weeklySentiment.score})`);
+  if (intel) console.log(`Daily intel       : ${intel.macroBias.toUpperCase()} (${intel.biasReason})${INTEL_DRY_RUN ? " [DRY-RUN]" : ""}`);
 
   let todayCount = countTodaysTrades();
   console.log(`Trades today: ${todayCount}/${CONFIG.maxTradesPerDay}`);
@@ -1558,7 +1669,7 @@ async function run() {
       }
 
       const mode = tier.label.includes("TIER 4") ? "momentum" : "trend";
-      await analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tier.mult, mode).catch(err =>
+      await analyzeSymbol(symbol, todayCount, fearGreed, weeklySentiment, tier.mult, mode, intel).catch(err =>
         console.log(`  ${symbol} error: ${err.message}`)
       );
     }
